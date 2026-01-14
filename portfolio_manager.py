@@ -18,7 +18,7 @@ class PortfolioManager:
         """Creates the three default risk profiles if they don't exist."""
         profiles = self.db.fetch_all("SELECT * FROM portfolios")
         if profiles.empty:
-            logger.info("Initializing default portfolios...")
+            logger.info("SYSTEM: Initializing default portfolios...")
             default_data = [
                 ("Conservative", 10000.0, 10000.0, 0.01),
                 ("Moderate", 10000.0, 10000.0, 0.05),
@@ -59,7 +59,7 @@ class PortfolioManager:
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
             (portfolio_id, symbol, entry_price, pos_value, quantity, sl, tp, direction, 'OPEN', notes, score_json)
         )
-        logger.info(f"Opened {direction} on {symbol} for Portfolio {portfolio_id} (Size: {pos_value} USDT)")
+        logger.info(f"TRADE OPENED: {direction} {symbol} | Portfolio {portfolio_id} | Size: {pos_value:.2f} USDT")
         return True
 
     def update_positions(self, symbol: str, current_price: float, high: float, low: float, trailing_sl: Optional[float] = None):
@@ -115,7 +115,7 @@ class PortfolioManager:
                 else: # SELL
                     pnl = (entry - exit_price) * qty
                 
-                self._close_trade(trade_id, portfolio_id, exit_price, pnl, new_status)
+                self._close_trade(trade_id, portfolio_id, exit_price, pnl, new_status, symbol=symbol)
                 continue
 
             if hit_tp and status == 'OPEN':
@@ -133,7 +133,7 @@ class PortfolioManager:
                     "UPDATE portfolios SET current_balance = current_balance + ? WHERE id = ?",
                     (pnl_half, portfolio_id)
                 )
-                logger.info(f"TP1 Hit for Trade {trade_id}! Closed 50%, SL moved to Breakeven. PnL realized: {pnl_half:.2f}")
+                logger.info(f"TP1 HIT: {symbol} | ID {trade_id} | PnL: {pnl_half:.2f} USDT")
                 continue
 
             # TP2 Logic: Trailing Stop
@@ -167,7 +167,7 @@ class PortfolioManager:
                 if dist_to_sl > 0 and (sl - high) / dist_to_sl <= near_threshold:
                     self._log_near_miss(trade_id, "NEAR_SL", high, (sl - high) / dist_to_sl if dist_to_sl > 0 else 0)
 
-    def _close_trade(self, trade_id: int, portfolio_id: int, exit_price: float, pnl: float, status: str):
+    def _close_trade(self, trade_id: int, portfolio_id: int, exit_price: float, pnl: float, status: str, symbol: str = "Unknown"):
         # Update trade
         # status must be passed exactly as 'CLOSED_TP' or 'CLOSED_SL' or 'MANUAL_CLOSE'
         self.db.execute_query(
@@ -179,7 +179,7 @@ class PortfolioManager:
             "UPDATE portfolios SET current_balance = current_balance + ? WHERE id = ?",
             (pnl, portfolio_id)
         )
-        logger.info(f"Closed Trade {trade_id} ({status}) | PnL: {pnl:.2f} USDT")
+        logger.info(f"TRADE CLOSED: ID {trade_id} | {symbol} | {status} | PnL: {pnl:.2f} USDT")
 
     def _log_near_miss(self, trade_id: int, event_type: str, price: float, dist_pct: float):
         # Check if already logged for this trade recently (to avoid spamming logs per candle)

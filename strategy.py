@@ -166,6 +166,7 @@ class ScalpingStrategy(BaseStrategy):
 
         # Threshold: Score >= 3.0 and MTF Trend Alignment
         if long_score >= 3.0 and htf_info != "Bearish":
+            logger.info(f"FOUND SIGNAL: LONG | Score: {long_score} | Breakdown: {long_score_map}")
             reason = "Scalping Long: "
             if last_row.get('bullish_sfp'): reason += "SFP Liquidity Sweep"
             elif sq_break_long: reason += "Squeeze Breakout"
@@ -175,6 +176,7 @@ class ScalpingStrategy(BaseStrategy):
             return signal
         
         if short_score >= 3.0 and htf_info != "Bullish":
+            logger.info(f"FOUND SIGNAL: SHORT | Score: {short_score} | Breakdown: {short_score_map}")
             reason = "Scalping Short: "
             if last_row.get('bearish_sfp'): reason += "SFP Liquidity Sweep"
             elif sq_break_short: reason += "Squeeze Breakout"
@@ -289,9 +291,11 @@ class SwingStrategy(BaseStrategy):
 
         # Threshold: Score >= 3 and MTF Trend Alignment
         if long_score >= 3 and htf_info != "Bearish":
+            logger.info(f"FOUND SIGNAL: LONG (Swing) | Score: {long_score} | Breakdown: {long_score_map}")
             return Signal(SignalType.BUY, f"Swing Long (Score {long_score})", "Swing", debug_info, strength=long_score/3.0, score_breakdown=long_score_map)
         
         if short_score >= 3 and htf_info != "Bullish":
+            logger.info(f"FOUND SIGNAL: SHORT (Swing) | Score: {short_score} | Breakdown: {short_score_map}")
             return Signal(SignalType.SELL, f"Swing Short (Score {short_score})", "Swing", debug_info, strength=short_score/3.0, score_breakdown=short_score_map)
 
         return Signal(SignalType.NEUTRAL, "No swing confluence", "Swing", debug_info)

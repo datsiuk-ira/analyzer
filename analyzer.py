@@ -28,11 +28,11 @@ class MarketAnalyzer:
             return df
 
         # --- Debug Data Integrity ---
-        logger.info(f"--- Indicator Calculation Debug ---")
-        logger.info(f"DataFrame Shape: {df.shape}")
-        logger.info(f"Columns: {df.columns.tolist()}")
-        logger.info(f"Data Types:\n{df.dtypes}")
-        logger.info(f"First 5 rows of 'close':\n{df['close'].head()}")
+        logger.debug(f"--- Indicator Calculation Debug ---")
+        logger.debug(f"DataFrame Shape: {df.shape}")
+        logger.debug(f"Columns: {df.columns.tolist()}")
+        # logger.debug(f"Data Types:\n{df.dtypes}")
+        # logger.debug(f"First 5 rows of 'close':\n{df['close'].head()}")
 
         # Force numeric types to ensure pandas_ta compatibility
         cols_to_fix = ['open', 'high', 'low', 'close', 'volume', 'taker_buy_vol']
@@ -182,7 +182,7 @@ class MarketAnalyzer:
             df['squeeze_breakout_short'] = False
 
         self.df = df # Update instance state
-        logger.info(f"Indicator calculation complete. Final shape: {df.shape}")
+        logger.debug(f"Indicator calculation complete. Final shape: {df.shape}")
         return df
 
     def to_heikin_ashi(self) -> pd.DataFrame:
@@ -220,7 +220,7 @@ class MarketAnalyzer:
         low_pivots = self.df[self.df['is_local_low']].copy()
         high_pivots = self.df[self.df['is_local_high']].copy()
         
-        logger.debug(f"Found {len(low_pivots)} low pivots and {len(high_pivots)} high pivots")
+        # logger.debug(f"Found {len(low_pivots)} low pivots and {len(high_pivots)} high pivots")
 
         # Bullish Divergence: Lower Low in Price + Higher Low in RSI
         if len(low_pivots) > 1:
@@ -228,7 +228,7 @@ class MarketAnalyzer:
             low_pivots['prev_low'] = low_pivots['low'].shift(1)
             low_pivots['prev_rsi'] = low_pivots['RSI'].shift(1)
             
-            logger.debug(f"Low Pivots:\n{low_pivots[['low', 'prev_low', 'RSI', 'prev_rsi']]}")
+            # logger.debug(f"Low Pivots:\n{low_pivots[['low', 'prev_low', 'RSI', 'prev_rsi']]}")
             
             bull_div_mask = (low_pivots['low'] < low_pivots['prev_low']) & \
                             (low_pivots['RSI'] > low_pivots['prev_rsi'])

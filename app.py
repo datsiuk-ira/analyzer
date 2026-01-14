@@ -38,6 +38,34 @@ def get_screen_results(timeframe, strat_settings):
     results = run_async(screener.scan_market(strat_settings))
     return results, datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+def change_symbol(new_symbol):
+    st.session_state.symbol = new_symbol
+
+def refresh_market():
+    st.session_state.last_screen_update = 0 # Force refresh
+
+def execute_quick_sim(coin, profile_name, signal_type, last_price, sl, tp, strategy_type, risk_mult, score_breakdown, er):
+    st.session_state.symbol = coin
+    # In a real app, you'd find the profile_id from profile_name
+    pm = st.session_state.pm
+    portfolios = pm.get_portfolios()
+    profile = portfolios[portfolios['name'] == profile_name]
+    if not profile.empty:
+        p_id = profile.iloc[0]['id']
+        success = pm.open_position(
+            p_id, coin, signal_type, last_price, sl, tp,
+            notes=f"Quick Sim: {strategy_type}",
+            risk_multiplier=risk_mult,
+            score_breakdown=score_breakdown,
+            efficiency_ratio=er
+        )
+        if success:
+            st.toast(f"Executed on {profile_name}", icon="✅")
+        else:
+            st.error(f"Failed to execute on {profile_name}")
+    else:
+        st.error(f"Profile {profile_name} not found")
+
 def main():
     st.set_page_config(page_title=settings.page_title, layout=settings.page_layout)
     
@@ -52,7 +80,6 @@ def main():
     if 'regime' not in st.session_state:
         st.session_state.regime = MarketRegime()
     if 'notifier' not in st.session_state:
-        # Load credentials from secrets or environment in real app
         st.session_state.notifier = NotificationManager()
     if 'sentiment' not in st.session_state:
         st.session_state.sentiment = SentimentAnalyzer()
@@ -62,18 +89,37 @@ def main():
         st.session_state.balance = 1000.0
     if 'trades' not in st.session_state:
         st.session_state.trades = []
+    
+    # Screener results persistence
+    if 'screener_results' not in st.session_state:
+        st.session_state.screener_results = pd.DataFrame()
+    if 'last_screen_update' not in st.session_state:
+        st.session_state.last_screen_update = 0
 
     st.title(f"🚀 {settings.page_title}")
 
     # Sidebar
     st.sidebar.header("Market Selection")
-    symbol = st.sidebar.selectbox("Select Symbol", settings.symbols, index=0)
+    
+    # Ensure st.session_state.symbol exists
+    if 'symbol' not in st.session_state:
+        st.session_state.symbol = settings.symbols[0]
+        
+    symbol = st.sidebar.selectbox("Select Symbol", settings.symbols, 
+                                  index=settings.symbols.index(st.session_state.symbol) if st.session_state.symbol in settings.symbols else 0,
+                                  key="sb_symbol_select",
+                                  on_change=lambda: st.session_state.update(symbol=st.session_state.sb_symbol_select))
+    
+    # Sync session state with sidebar selection
+    st.session_state.symbol = symbol
     timeframe = st.sidebar.selectbox("Select Timeframe", settings.timeframes, index=3)
     htf = settings.htf_map.get(timeframe, "1d")
     
     auto_refresh = st.sidebar.checkbox("Auto-Refresh", value=False)
     if auto_refresh:
         st_autorefresh(interval=60 * 1000, key="market_refresh")
+        # Trigger market scan refresh on auto-refresh
+        st.session_state.last_screen_update = 0 
 
     show_heikin = st.sidebar.checkbox("Show Heikin Ashi", value=False)
 
@@ -106,8 +152,20 @@ def main():
 
     # Telegram Test
     if st.sidebar.button("🔔 Test Notification"):
-        st.session_state.notifier.notify("✅ *Telegram Connection Test*: Success!")
-        st.sidebar.success("Test notification sent!")
+        with st.sidebar:
+            with st.spinner("Sending test..."):
+                try:
+                    test_msg = "✅ *Telegram Connection Test*: Success!"
+                    # Ensure we run this correctly in Streamlit's environment
+                    result = run_async(st.session_state.notifier._send_telegram(test_msg))
+                    if result and result.get("success"):
+                        st.success("Test notification sent!")
+                        st.toast("Telegram connected successfully!", icon="✅")
+                    else:
+                        error_msg = result.get("message", "Unknown error") if result else "No response"
+                        st.error(f"Failed: {error_msg}")
+                except Exception as e:
+                    st.error(f"Error: {str(e)}")
 
     # Update Market Regime (async) with caching
     now = time.time()
@@ -136,27 +194,76 @@ def main():
 def render_analysis_tab(symbol, timeframe, htf, show_heikin, strategy_type, risk_pct, rr_ratio):
     # Market Screener at Top
     with st.container():
-        st.subheader("🔥 Market Opportunities (Top 50 Volume)")
+        c_title, c_refresh = st.columns([3, 1])
+        with c_title:
+            st.subheader("🔥 Market Opportunities (Top 50 Volume)")
+        with c_refresh:
+            if st.button("🔄 Refresh Market", on_click=refresh_market):
+                pass # on_click handles it
         
-        strat_settings = {
+        current_settings = {
             'ema_short': settings.ema_short,
             'ema_long': settings.ema_long,
             'ema_trend': settings.ema_trend,
+            'rsi_period': settings.rsi_period,
             'rsi_overbought': settings.rsi_overbought,
             'rsi_oversold': settings.rsi_oversold,
+            'adx_threshold': settings.adx_threshold,
             'volume_multiplier': settings.volume_multiplier,
-            'adx_threshold': settings.adx_threshold
+            'atr_multiplier': settings.atr_multiplier
         }
         
-        with st.spinner("Scanning for opportunities..."):
-            screen_results, last_updated = get_screen_results(timeframe, strat_settings)
+        now = time.time()
+        if st.session_state.screener_results.empty or (now - st.session_state.last_screen_update > 300):
+            with st.spinner("Scanning for opportunities..."):
+                screen_results, last_updated = get_screen_results(timeframe, current_settings)
+                st.session_state.screener_results = screen_results
+                st.session_state.last_screen_update = now
+                st.session_state.last_updated_str = last_updated
+        
+        screen_results = st.session_state.screener_results
+        last_updated = st.session_state.get('last_updated_str', 'N/A')
             
         if not screen_results.empty:
             st.caption(f"Last updated: {last_updated}")
-            st.dataframe(screen_results.style.map(
-                lambda x: 'background-color: rgba(0, 255, 0, 0.2)' if str(x).startswith('BUY') else ('background-color: rgba(255, 0, 0, 0.2)' if str(x).startswith('SELL') else ''),
-                subset=['Signal']
-            ), width="stretch")
+            
+            # Interactive Screener UI
+            for idx, row in screen_results.iterrows():
+                coin = row['Symbol']
+                price = row['Price']
+                signal_val = row['Signal']
+                score = row['Score']
+                status = row['Status']
+                
+                # Layout for each coin
+                c1, c2, c3, c4 = st.columns([1.5, 1.5, 1, 1.5])
+                
+                with c1:
+                    st.markdown(f"**{coin}**")
+                    st.markdown(f"Price: `{price}`")
+                
+                with c2:
+                    # Signal Badge
+                    badge_color = "green" if "BUY" in row['Signal'] else "red" if "SELL" in row['Signal'] else "gray"
+                    st.markdown(f":{badge_color}[{row['SignalText']}]")
+                    st.caption(f"Score: {score}/3.0 ({status})")
+                
+                with c3:
+                    st.button("Chart", key=f"btn_chart_{coin}", on_click=change_symbol, args=(coin,))
+                
+                with c4:
+                    # Quick Simulation
+                    profile_options = ["Moderate", "Conservative", "Aggressive"]
+                    selected_profile = st.selectbox("Profile", profile_options, key=f"sim_profile_{coin}", label_visibility="collapsed")
+                    
+                    if st.button("Quick Sim", key=f"btn_sim_{coin}"):
+                        execute_quick_sim(
+                            coin, selected_profile, row['Signal'], row['Price'], 
+                            row['SL'], row['TP'], strategy_type, row['Strength'], 
+                            row['Breakdown'], row['ER']
+                        )
+
+            st.divider()
         else:
             st.info("No strong opportunities found currently. Scanning Top 50 volume pairs...")
 
@@ -197,6 +304,7 @@ def render_analysis_tab(symbol, timeframe, htf, show_heikin, strategy_type, risk
         ema_slow=settings.ema_long,
         ema_trend=settings.ema_trend,
         rsi_period=settings.rsi_period,
+        atr_period=settings.atr_period,
         adx_period=settings.adx_period
     )
     # The analyzer.df is updated inside calculate_indicators, so detect_rsi_divergence will see the new columns

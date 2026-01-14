@@ -14,10 +14,11 @@ class NotificationManager:
         self.chat_id = chat_id or settings.telegram_chat_id
         self.api_url = f"https://api.telegram.org/bot{self.token}/sendMessage" if self.token else None
 
-    async def _send_telegram(self, message: str):
+    async def _send_telegram(self, message: str) -> dict:
         if not self.token or not self.chat_id:
-            logger.debug("Telegram credentials missing. Skipping notification.")
-            return
+            msg = "Telegram credentials missing. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env"
+            logger.debug(msg)
+            return {"success": False, "message": msg}
 
         try:
             async with aiohttp.ClientSession() as session:
@@ -26,12 +27,18 @@ class NotificationManager:
                     "text": message,
                     "parse_mode": "Markdown"
                 }
-                async with session.post(self.api_url, json=payload, timeout=5) as response:
+                async with session.post(self.api_url, json=payload, timeout=10) as response:
+                    text = await response.text()
                     if response.status != 200:
-                        text = await response.text()
-                        logger.error(f"Telegram notification failed: {text}")
+                        logger.error(f"Telegram notification failed (Status {response.status}): {text}")
+                        return {"success": False, "message": f"HTTP {response.status}: {text}"}
+                    return {"success": True, "message": "Sent successfully!"}
+        except asyncio.TimeoutError:
+            logger.error("Telegram notification timeout")
+            return {"success": False, "message": "Connection timeout"}
         except Exception as e:
             logger.error(f"Error sending Telegram notification: {e}")
+            return {"success": False, "message": f"Exception: {str(e)}"}
 
     def notify(self, message: str):
         """

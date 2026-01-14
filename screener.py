@@ -1,9 +1,11 @@
 import pandas as pd
 import asyncio
+import json
 from typing import List, Dict, Any
 from data_loader import BinanceFetcher
 from analyzer import MarketAnalyzer
 from strategy import ScalpingStrategy, SignalType
+from risk_manager import RiskCalculator
 from logger import logger
 
 class MarketScreener:
@@ -22,7 +24,7 @@ class MarketScreener:
         try:
             # 1. Fetch Top 50 Volatile Pairs if no symbols provided
             if not self.symbols:
-                logger.info(f"Fetching top {top_limit} volume pairs...")
+                logger.debug(f"Fetching top {top_limit} volume pairs...")
                 self.symbols = await fetcher.fetch_top_volume_pairs(limit=top_limit)
             
             if not self.symbols:
@@ -41,18 +43,20 @@ class MarketScreener:
                 df = analyzer.calculate_indicators(
                     ema_fast=strat_settings.get('ema_short', 20),
                     ema_slow=strat_settings.get('ema_long', 50),
-                    ema_trend=strat_settings.get('ema_trend', 200)
+                    ema_trend=strat_settings.get('ema_trend', 200),
+                    rsi_period=strat_settings.get('rsi_period', 14),
+                    adx_period=strat_settings.get('adx_period', 14)
                 )
                 df = analyzer.detect_rsi_divergence()
+                df = analyzer.detect_patterns()
+                df = analyzer.identify_structure()
                 
                 # Apply Scalping Strategy logic for screening
-                strategy = ScalpingStrategy(df, None, strat_settings)
+                # Use strategy_type from settings if provided, default to Scalping
+                strategy_class = ScalpingStrategy
+                strategy = strategy_class(df, None, strat_settings)
                 signal = strategy.generate_signal()
                 
-                # Filter: Only keep rows where Signal != NEUTRAL
-                if signal.type == SignalType.NEUTRAL:
-                    continue
-
                 last_row = df.iloc[-1]
                 ema_trend = last_row.get('EMA_TREND')
                 if pd.isna(ema_trend):
@@ -68,15 +72,46 @@ class MarketScreener:
                 signal_text = f"{signal.type.value}*" if has_div else signal.type.value
 
                 score = float(signal.debug_info.get('Score', 0)) if signal.debug_info else 0.0
+                
+                # Status: if Score >= 3 -> "SIGNAL", if Score >= 2 -> "NEAR MISS", else "WAIT"
+                if score >= 3.0:
+                    status = "🟢 SIGNAL"
+                elif score >= 2.0:
+                    status = "🟡 NEAR MISS"
+                else:
+                    status = "⚪ WAIT"
+
+                # Log score breakdown for audit
+                breakdown_str = json.dumps(signal.score_breakdown) if signal.score_breakdown else "N/A"
+                logger.debug(f"Screener: {symbol} | Score: {score} | Status: {status} | Breakdown: {breakdown_str}")
+
+                # Collect extra data for Quick Sim
+                # We'll need last_price, SL, TP, strength, breakdown, efficiency_ratio
+                last_price = float(last_row['close'])
+                # Quick ATR-based SL/TP for screener results
+                atr_val = last_row.get('ATR')
+                if pd.isna(atr_val) or atr_val == 0:
+                    atr_val = last_price * 0.02 # fallback
+                
+                # Use default 2.0 multiplier and 2.0 RR for quick sim
+                risk_calc_temp = RiskCalculator(10000, 1.0, 2.0)
+                sl, tp = risk_calc_temp.calculate_levels(last_price, atr_val, signal.type.value)
+                er = last_row.get('efficiency_ratio', 1.0)
 
                 results.append({
                     "Symbol": symbol,
-                    "Price": round(last_row['close'], 4),
+                    "Price": round(last_price, 4),
                     "Trend": trend,
                     "ADX": round(adx, 2),
-                    "Signal": signal_text,
+                    "Signal": signal.type.value,
+                    "SignalText": signal_text,
                     "Score": score,
-                    "Strength": round(signal.strength, 2)
+                    "Status": status,
+                    "Strength": round(signal.strength, 2),
+                    "SL": sl,
+                    "TP": tp,
+                    "Breakdown": signal.score_breakdown,
+                    "ER": er
                 })
             
             df_results = pd.DataFrame(results)
@@ -85,6 +120,6 @@ class MarketScreener:
             if not df_results.empty:
                 df_results = df_results.sort_values(by="Score", ascending=False)
                 
-            return df_results
+            return df_results.head(10)
         finally:
             await fetcher.close()
