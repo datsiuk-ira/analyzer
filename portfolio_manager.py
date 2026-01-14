@@ -6,12 +6,17 @@ from datetime import datetime
 from typing import Optional
 import json
 
+from notifications import NotificationManager
+
 class PortfolioManager:
     """
     Manages multiple trading portfolios and their trade lifecycle.
     """
-    def __init__(self, db_manager: DatabaseManager):
+    LEVERAGE = 10.0
+
+    def __init__(self, db_manager: DatabaseManager, notifier: Optional[NotificationManager] = None):
         self.db = db_manager
+        self.notifier = notifier
         self._ensure_default_profiles()
 
     def _ensure_default_profiles(self):
@@ -35,6 +40,13 @@ class PortfolioManager:
 
     def open_position(self, portfolio_id: int, symbol: str, direction: str, entry_price: float, sl: float, tp: float, notes: str = "", risk_multiplier: float = 1.0, score_breakdown: dict = None, efficiency_ratio: float = 1.0):
         """Calculates size and opens a position for a specific portfolio."""
+        # Ensure portfolio_id is an integer (sometimes passed as string from UI)
+        try:
+            portfolio_id = int(portfolio_id)
+        except (ValueError, TypeError):
+            logger.error(f"Invalid portfolio_id: {portfolio_id}")
+            return False
+
         portfolio = self.db.fetch_all("SELECT * FROM portfolios WHERE id = ?", (portfolio_id,))
         if portfolio.empty:
             logger.error(f"Portfolio {portfolio_id} not found.")
@@ -52,14 +64,41 @@ class PortfolioManager:
             logger.warning(f"Invalid quantity calculated for {symbol} in portfolio {portfolio_id}")
             return False
 
+        # Professional Portfolio Math: Dynamic Safe Leverage
+        # Safe_Lev = 1.0 / (Stop_Distance_Pct * 1.5)
+        stop_dist_pct = abs(entry_price - sl) / entry_price
+        if stop_dist_pct > 0:
+            safe_lev = 1.0 / (stop_dist_pct * 1.5)
+        else:
+            safe_lev = 1.0 # Fallback
+            
+        actual_lev = min(max(safe_lev, 1.0), 20.0)
+        actual_lev = round(actual_lev, 1)
+
+        # Leverage Logic: Calculate Margin Cost
+        margin_cost = pos_value / actual_lev
+        if margin_cost > balance:
+            logger.error(f"Insufficient Margin: Needed {margin_cost:.2f}, Balance {balance:.2f}")
+            return False
+
         score_json = json.dumps(score_breakdown) if score_breakdown else None
 
         self.db.execute_query(
-            '''INSERT INTO trades (portfolio_id, symbol, entry_price, position_size_usdt, quantity, stop_loss, take_profit, direction, status, notes, score_breakdown)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-            (portfolio_id, symbol, entry_price, pos_value, quantity, sl, tp, direction, 'OPEN', notes, score_json)
+            '''INSERT INTO trades (portfolio_id, symbol, entry_price, position_size_usdt, quantity, stop_loss, take_profit, direction, status, notes, score_breakdown, leverage)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+            (portfolio_id, symbol, entry_price, pos_value, quantity, sl, tp, direction, 'OPEN', notes, score_json, actual_lev)
         )
-        logger.info(f"TRADE OPENED: {direction} {symbol} | Portfolio {portfolio_id} | Size: {pos_value:.2f} USDT")
+        # Deduct balance (Lock Margin)
+        self.db.execute_query(
+            "UPDATE portfolios SET current_balance = current_balance - ? WHERE id = ?",
+            (margin_cost, portfolio_id)
+        )
+        logger.info(f"TRADE OPENED: {direction} {symbol} | Portfolio {portfolio_id} | Margin: {margin_cost:.2f} USDT (Lev: {actual_lev}x) | Balance Deducted")
+        
+        # Trigger Notification
+        if self.notifier:
+            self.notifier.notify_trade_opened(symbol, direction, entry_price, pos_value, sl, tp, portfolio.iloc[0]['name'])
+            
         return True
 
     def update_positions(self, symbol: str, current_price: float, high: float, low: float, trailing_sl: Optional[float] = None):
@@ -123,17 +162,26 @@ class PortfolioManager:
                 exit_price = tp
                 pnl_half = ((exit_price - entry) * (qty * 0.5)) if direction == 'BUY' else ((entry - exit_price) * (qty * 0.5))
                 
-                # Update Trade: quantity = 50%, status = 'PARTIAL', sl = entry
+                # Get current position size to halve it
+                pos_size_half = trade['position_size_usdt'] * 0.5
+                lev = trade.get('leverage', self.LEVERAGE)
+                margin_cost_half = pos_size_half / lev
+                
+                # Update Trade: quantity = 50%, status = 'PARTIAL', sl = entry, position_size_usdt = 50%
                 self.db.execute_query(
-                    "UPDATE trades SET quantity = ?, status = 'PARTIAL', stop_loss = ?, pnl = COALESCE(pnl, 0) + ? WHERE id = ?",
-                    (qty * 0.5, entry, pnl_half, trade_id)
+                    "UPDATE trades SET quantity = ?, status = 'PARTIAL', stop_loss = ?, pnl = COALESCE(pnl, 0) + ?, position_size_usdt = ? WHERE id = ?",
+                    (qty * 0.5, entry, pnl_half, pos_size_half, trade_id)
                 )
-                # Update Portfolio Balance with realized PnL from the half
+                # Update Portfolio Balance with realized PnL from the half AND return the locked margin for that half
+                return_amount = margin_cost_half + pnl_half
                 self.db.execute_query(
                     "UPDATE portfolios SET current_balance = current_balance + ? WHERE id = ?",
-                    (pnl_half, portfolio_id)
+                    (return_amount, portfolio_id)
                 )
-                logger.info(f"TP1 HIT: {symbol} | ID {trade_id} | PnL: {pnl_half:.2f} USDT")
+                logger.info(f"TP1 HIT: {symbol} | ID {trade_id} | Returned: {return_amount:.2f} USDT (PnL: {pnl_half:.2f})")
+                
+                if self.notifier:
+                    self.notifier.notify_trade_closed(trade_id, symbol, "PARTIAL_TP1", pnl_half)
                 continue
 
             # TP2 Logic: Trailing Stop
@@ -155,39 +203,56 @@ class PortfolioManager:
             if direction == 'BUY':
                 # Near TP
                 if dist_to_tp > 0 and (tp - high) / dist_to_tp <= near_threshold:
-                    self._log_near_miss(trade_id, "NEAR_TP", high, (tp - high) / dist_to_tp if dist_to_tp > 0 else 0)
+                    self._log_near_miss(trade_id, "NEAR_TP", high, (tp - high) / dist_to_tp if dist_to_tp > 0 else 0, symbol=symbol, direction=direction)
                 # Near SL
                 if dist_to_sl > 0 and (low - sl) / dist_to_sl <= near_threshold:
-                    self._log_near_miss(trade_id, "NEAR_SL", low, (low - sl) / dist_to_sl if dist_to_sl > 0 else 0)
+                    self._log_near_miss(trade_id, "NEAR_SL", low, (low - sl) / dist_to_sl if dist_to_sl > 0 else 0, symbol=symbol, direction=direction)
             else: # SELL
                 # Near TP
                 if dist_to_tp > 0 and (low - tp) / dist_to_tp <= near_threshold:
-                    self._log_near_miss(trade_id, "NEAR_TP", low, (low - tp) / dist_to_tp if dist_to_tp > 0 else 0)
+                    self._log_near_miss(trade_id, "NEAR_TP", low, (low - tp) / dist_to_tp if dist_to_tp > 0 else 0, symbol=symbol, direction=direction)
                 # Near SL
                 if dist_to_sl > 0 and (sl - high) / dist_to_sl <= near_threshold:
-                    self._log_near_miss(trade_id, "NEAR_SL", high, (sl - high) / dist_to_sl if dist_to_sl > 0 else 0)
+                    self._log_near_miss(trade_id, "NEAR_SL", high, (sl - high) / dist_to_sl if dist_to_sl > 0 else 0, symbol=symbol, direction=direction)
 
     def _close_trade(self, trade_id: int, portfolio_id: int, exit_price: float, pnl: float, status: str, symbol: str = "Unknown"):
+        # Get trade info for position_size_usdt
+        trade = self.db.fetch_all("SELECT position_size_usdt, status, leverage FROM trades WHERE id = ?", (trade_id,))
+        if trade.empty:
+            logger.error(f"Trade {trade_id} not found for closing.")
+            return
+
+        pos_size = trade.iloc[0]['position_size_usdt']
+        lev = trade.iloc[0]['leverage'] if trade.iloc[0]['leverage'] else self.LEVERAGE
+        margin_cost = pos_size / lev
+
         # Update trade
         # status must be passed exactly as 'CLOSED_TP' or 'CLOSED_SL' or 'MANUAL_CLOSE'
         self.db.execute_query(
-            "UPDATE trades SET status = ?, exit_time = CURRENT_TIMESTAMP, exit_price = ?, pnl = ? WHERE id = ?",
+            "UPDATE trades SET status = ?, exit_time = CURRENT_TIMESTAMP, exit_price = ?, pnl = COALESCE(pnl, 0) + ? WHERE id = ?",
             (status, exit_price, pnl, trade_id)
         )
-        # Update portfolio balance
+        # Update portfolio balance: return margin_cost + pnl
+        return_amount = margin_cost + pnl
+        
         self.db.execute_query(
             "UPDATE portfolios SET current_balance = current_balance + ? WHERE id = ?",
-            (pnl, portfolio_id)
+            (return_amount, portfolio_id)
         )
-        logger.info(f"TRADE CLOSED: ID {trade_id} | {symbol} | {status} | PnL: {pnl:.2f} USDT")
+        logger.info(f"TRADE CLOSED: ID {trade_id} | {symbol} | {status} | PnL: {pnl:.2f} USDT | Returned: {return_amount:.2f} USDT")
 
-    def _log_near_miss(self, trade_id: int, event_type: str, price: float, dist_pct: float):
+        if self.notifier:
+            self.notifier.notify_trade_closed(trade_id, symbol, status, pnl)
+
+    def _log_near_miss(self, trade_id: int, event_type: str, price: float, dist_pct: float, symbol: str = "Unknown", direction: str = "Unknown"):
         # Check if already logged for this trade recently (to avoid spamming logs per candle)
         # For simplicity, we just log it. In a real system we might check timestamp.
         self.db.execute_query(
             "INSERT INTO trade_logs (trade_id, event_type, price_reached, distance_pct) VALUES (?, ?, ?, ?)",
             (trade_id, event_type, price, dist_pct)
         )
+        if self.notifier:
+            self.notifier.notify_near_miss(symbol, direction, event_type, price, dist_pct)
 
     def calculate_advanced_stats(self, portfolio_id: int) -> dict:
         """Calculates institutional metrics for a portfolio."""

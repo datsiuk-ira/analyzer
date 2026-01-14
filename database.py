@@ -58,6 +58,7 @@ class DatabaseManager:
                 pnl REAL,
                 notes TEXT,
                 score_breakdown TEXT,
+                leverage REAL DEFAULT 1.0,
                 FOREIGN KEY (portfolio_id) REFERENCES portfolios(id)
             )
         ''')

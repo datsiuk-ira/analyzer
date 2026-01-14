@@ -39,6 +39,8 @@ def get_screen_results(timeframe, strat_settings):
     return results, datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 def change_symbol(new_symbol):
+    if new_symbol not in settings.symbols:
+        settings.symbols.append(new_symbol)
     st.session_state.symbol = new_symbol
 
 def refresh_market():
@@ -51,7 +53,7 @@ def execute_quick_sim(coin, profile_name, signal_type, last_price, sl, tp, strat
     portfolios = pm.get_portfolios()
     profile = portfolios[portfolios['name'] == profile_name]
     if not profile.empty:
-        p_id = profile.iloc[0]['id']
+        p_id = int(profile.iloc[0]['id'])
         success = pm.open_position(
             p_id, coin, signal_type, last_price, sl, tp,
             notes=f"Quick Sim: {strategy_type}",
@@ -73,14 +75,17 @@ def main():
     if 'db' not in st.session_state:
         st.session_state.db = DatabaseManager()
     
-    # Check for stale PortfolioManager instance (missing new methods)
-    if 'pm' not in st.session_state or not hasattr(st.session_state.pm, 'calculate_advanced_stats'):
-        st.session_state.pm = PortfolioManager(st.session_state.db)
-        logger.info("Re-initialized PortfolioManager to update class methods.")
-    if 'regime' not in st.session_state:
-        st.session_state.regime = MarketRegime()
     if 'notifier' not in st.session_state:
         st.session_state.notifier = NotificationManager()
+
+    # Check for stale PortfolioManager instance (missing new methods or leverage)
+    if 'pm' not in st.session_state or not hasattr(st.session_state.pm, 'LEVERAGE'):
+        st.session_state.pm = PortfolioManager(st.session_state.db, notifier=st.session_state.notifier)
+        logger.info("Re-initialized PortfolioManager with notifier and leverage logic.")
+    
+    if 'regime' not in st.session_state:
+        st.session_state.regime = MarketRegime()
+    
     if 'sentiment' not in st.session_state:
         st.session_state.sentiment = SentimentAnalyzer()
     
@@ -157,7 +162,7 @@ def main():
                 try:
                     test_msg = "✅ *Telegram Connection Test*: Success!"
                     # Ensure we run this correctly in Streamlit's environment
-                    result = run_async(st.session_state.notifier._send_telegram(test_msg))
+                    result = st.session_state.notifier._send_telegram(test_msg)
                     if result and result.get("success"):
                         st.success("Test notification sent!")
                         st.toast("Telegram connected successfully!", icon="✅")
@@ -433,9 +438,10 @@ def render_analysis_tab(symbol, timeframe, htf, show_heikin, strategy_type, risk
             er = last_row.get('efficiency_ratio', 1.0)
             
             for idx, (_, p) in enumerate(portfolios.iterrows()):
-                if p_cols[idx].button(f"Simulate {p['name']}", key=f"sim_{p['id']}"):
+                p_id_val = int(p['id'])
+                if p_cols[idx].button(f"Simulate {p['name']}", key=f"sim_{p_id_val}"):
                     success = st.session_state.pm.open_position(
-                        p['id'], symbol, signal.type.value, last_price, sl, tp,
+                        p_id_val, symbol, signal.type.value, last_price, sl, tp,
                         notes=f"Strategy: {strategy_type}",
                         risk_multiplier=risk_mult,
                         score_breakdown=signal.score_breakdown,
@@ -448,8 +454,9 @@ def render_analysis_tab(symbol, timeframe, htf, show_heikin, strategy_type, risk
 
             if st.button("Simulate on ALL Profiles"):
                 for _, p in portfolios.iterrows():
+                    p_id_val = int(p['id'])
                     st.session_state.pm.open_position(
-                        p['id'], symbol, signal.type.value, last_price, sl, tp,
+                        p_id_val, symbol, signal.type.value, last_price, sl, tp,
                         notes=f"Strategy: {strategy_type}",
                         risk_multiplier=risk_mult,
                         score_breakdown=signal.score_breakdown,
@@ -504,9 +511,21 @@ def render_portfolio_tab():
     # Active Trades
     st.divider()
     st.subheader("🔍 Open Positions")
-    open_trades = pm.db.fetch_all("SELECT * FROM trades WHERE status IN ('OPEN', 'PARTIAL')")
+    open_trades = pm.db.fetch_all("""
+        SELECT t.*, p.name as portfolio_name 
+        FROM trades t 
+        JOIN portfolios p ON t.portfolio_id = p.id 
+        WHERE t.status IN ('OPEN', 'PARTIAL')
+    """)
     if not open_trades.empty:
-        st.dataframe(open_trades, width="stretch")
+        # Reorder columns to show Portfolio Name nicely
+        # Show leverage as "Lev (x)"
+        if 'leverage' in open_trades.columns:
+            open_trades = open_trades.rename(columns={'leverage': 'Lev (x)'})
+        
+        cols = ['id', 'portfolio_name', 'symbol', 'direction', 'entry_price', 'quantity', 'Lev (x)', 'status', 'entry_time']
+        display_df = open_trades[[c for c in cols if c in open_trades.columns]]
+        st.dataframe(display_df, use_container_width=True)
         if st.button("Refresh PnL & Close Checks"):
             st.rerun()
     else:
