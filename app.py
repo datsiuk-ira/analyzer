@@ -1,0 +1,447 @@
+import streamlit as st
+import pandas as pd
+import asyncio
+from config import settings
+from data_loader import BinanceFetcher
+from analyzer import MarketAnalyzer
+from strategy import ScalpingStrategy, SwingStrategy, SignalType, Signal
+from risk_manager import RiskCalculator
+from plotter import ChartBuilder
+from screener import MarketScreener
+from database import DatabaseManager
+from portfolio_manager import PortfolioManager
+from correlation import MarketRegime
+from notifications import NotificationManager
+from sentiment import SentimentAnalyzer
+from pattern_matcher import PatternMatcher
+from streamlit_autorefresh import st_autorefresh
+from logger import logger
+import time
+from datetime import datetime
+import json
+
+def run_async(coro):
+    return asyncio.run(coro)
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_market_data(symbol, timeframe, htf):
+    fetcher = BinanceFetcher()
+    try:
+        data_map = run_async(fetcher.fetch_multiple_ohlcv(symbol, [timeframe, htf]))
+        return data_map
+    finally:
+        run_async(fetcher.close())
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_screen_results(timeframe, strat_settings):
+    screener = MarketScreener(timeframe=timeframe)
+    results = run_async(screener.scan_market(strat_settings))
+    return results, datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def main():
+    st.set_page_config(page_title=settings.page_title, layout=settings.page_layout)
+    
+    # Initialization
+    if 'db' not in st.session_state:
+        st.session_state.db = DatabaseManager()
+    
+    # Check for stale PortfolioManager instance (missing new methods)
+    if 'pm' not in st.session_state or not hasattr(st.session_state.pm, 'calculate_advanced_stats'):
+        st.session_state.pm = PortfolioManager(st.session_state.db)
+        logger.info("Re-initialized PortfolioManager to update class methods.")
+    if 'regime' not in st.session_state:
+        st.session_state.regime = MarketRegime()
+    if 'notifier' not in st.session_state:
+        # Load credentials from secrets or environment in real app
+        st.session_state.notifier = NotificationManager()
+    if 'sentiment' not in st.session_state:
+        st.session_state.sentiment = SentimentAnalyzer()
+    
+    # Paper Trading Session State
+    if 'balance' not in st.session_state:
+        st.session_state.balance = 1000.0
+    if 'trades' not in st.session_state:
+        st.session_state.trades = []
+
+    st.title(f"🚀 {settings.page_title}")
+
+    # Sidebar
+    st.sidebar.header("Market Selection")
+    symbol = st.sidebar.selectbox("Select Symbol", settings.symbols, index=0)
+    timeframe = st.sidebar.selectbox("Select Timeframe", settings.timeframes, index=3)
+    htf = settings.htf_map.get(timeframe, "1d")
+    
+    auto_refresh = st.sidebar.checkbox("Auto-Refresh", value=False)
+    if auto_refresh:
+        st_autorefresh(interval=60 * 1000, key="market_refresh")
+
+    show_heikin = st.sidebar.checkbox("Show Heikin Ashi", value=False)
+
+    st.sidebar.divider()
+    st.sidebar.header("Strategy Settings")
+    strategy_type = st.sidebar.selectbox("Strategy Style", ["Scalping", "Swing"], index=1)
+    
+    with st.sidebar.expander("Advanced Strategy Settings", expanded=False):
+        settings.update(
+            ema_short = st.number_input("EMA Fast", value=settings.ema_short),
+            ema_long = st.number_input("EMA Slow", value=settings.ema_long),
+            ema_trend = st.number_input("EMA Trend", value=settings.ema_trend),
+            rsi_period = st.number_input("RSI Period", value=settings.rsi_period),
+            rsi_overbought = st.slider("RSI Overbought", 50, 90, settings.rsi_overbought),
+            rsi_oversold = st.slider("RSI Oversold", 10, 50, settings.rsi_oversold),
+            adx_threshold = st.slider("ADX Threshold", 10, 40, settings.adx_threshold),
+            volume_multiplier = st.slider("Volume Multiplier", 1.0, 3.0, settings.volume_multiplier, 0.1),
+            atr_multiplier = st.slider("ATR Multiplier (SL)", 1.0, 5.0, settings.atr_multiplier, 0.1)
+        )
+
+    st.sidebar.divider()
+    st.sidebar.header("Risk Management")
+    # balance = st.sidebar.number_input("Account Balance (USDT)", min_value=10.0, value=st.session_state.balance, step=100.0)
+    risk_pct = st.sidebar.slider("Base Risk Per Trade (%)", min_value=0.1, max_value=5.0, value=settings.risk_pct, step=0.1)
+    rr_ratio = st.sidebar.slider("Risk/Reward Ratio", min_value=1.0, max_value=5.0, value=settings.rr_ratio, step=0.5)
+
+    # Sentiment & BTC Regime Info
+    fng_index = st.session_state.sentiment.get_fng_index()
+    st.sidebar.metric("Fear & Greed Index", fng_index)
+
+    # Telegram Test
+    if st.sidebar.button("🔔 Test Notification"):
+        st.session_state.notifier.notify("✅ *Telegram Connection Test*: Success!")
+        st.sidebar.success("Test notification sent!")
+
+    # Update Market Regime (async) with caching
+    now = time.time()
+    if 'last_regime_update' not in st.session_state or now - st.session_state.last_regime_update > 300: # 5 min
+        with st.spinner("Analyzing Market Regime..."):
+            old_regime = st.session_state.regime.regime
+            run_async(st.session_state.regime.update(timeframe="1h"))
+            st.session_state.last_regime_update = now
+            if old_regime != st.session_state.regime.regime:
+                st.session_state.notifier.notify_regime_change(st.session_state.regime.regime, st.session_state.regime.risk_off)
+    
+    regime_color = "green" if st.session_state.regime.regime == "BULLISH" else "red" if st.session_state.regime.regime == "BEARISH" else "gray"
+    st.sidebar.markdown(f"**BTC Regime:** :{regime_color}[{st.session_state.regime.regime}]")
+    if st.session_state.regime.risk_off:
+        st.sidebar.warning("⚠️ RISK OFF MODE ACTIVE (-50% Size)")
+
+    # Tabs
+    tab_analysis, tab_portfolio = st.tabs(["📈 Market Analysis", "💼 Simulation & Portfolio"])
+
+    with tab_analysis:
+        render_analysis_tab(symbol, timeframe, htf, show_heikin, strategy_type, risk_pct, rr_ratio)
+
+    with tab_portfolio:
+        render_portfolio_tab()
+
+def render_analysis_tab(symbol, timeframe, htf, show_heikin, strategy_type, risk_pct, rr_ratio):
+    # Market Screener at Top
+    with st.container():
+        st.subheader("🔥 Market Opportunities (Top 50 Volume)")
+        
+        strat_settings = {
+            'ema_short': settings.ema_short,
+            'ema_long': settings.ema_long,
+            'ema_trend': settings.ema_trend,
+            'rsi_overbought': settings.rsi_overbought,
+            'rsi_oversold': settings.rsi_oversold,
+            'volume_multiplier': settings.volume_multiplier,
+            'adx_threshold': settings.adx_threshold
+        }
+        
+        with st.spinner("Scanning for opportunities..."):
+            screen_results, last_updated = get_screen_results(timeframe, strat_settings)
+            
+        if not screen_results.empty:
+            st.caption(f"Last updated: {last_updated}")
+            st.dataframe(screen_results.style.map(
+                lambda x: 'background-color: rgba(0, 255, 0, 0.2)' if str(x).startswith('BUY') else ('background-color: rgba(255, 0, 0, 0.2)' if str(x).startswith('SELL') else ''),
+                subset=['Signal']
+            ), width="stretch")
+        else:
+            st.info("No strong opportunities found currently. Scanning Top 50 volume pairs...")
+
+    st.divider()
+
+    # Data Fetching
+    htf = settings.htf_map.get(timeframe, "1d")
+    data_map = fetch_market_data(symbol, timeframe, htf)
+    
+    df = data_map.get(timeframe)
+    htf_df = data_map.get(htf)
+    
+    if df is None or df.empty:
+        st.error("Failed to fetch data.")
+        return
+
+    last_price = df.iloc[-1]['close']
+
+    # Countdown to next candle
+    if not df.empty:
+        last_ts = df['timestamp'].iloc[-1]
+        tf_delta = pd.to_timedelta(timeframe.replace('m', 'min').replace('h', 'hour').replace('d', 'day').replace('w', 'week'))
+        next_candle = last_ts + tf_delta
+        now = datetime.now()
+        remaining = next_candle - now
+        if remaining.total_seconds() > 0:
+            st.caption(f"⏱️ Next candle in: {str(remaining).split('.')[0]}")
+
+    # HTF Analysis
+    if htf_df is not None and not htf_df.empty:
+        htf_analyzer = MarketAnalyzer(htf_df)
+        htf_df = htf_analyzer.calculate_indicators(ema_trend=settings.ema_trend)
+
+    # Main Analysis
+    analyzer = MarketAnalyzer(df)
+    df = analyzer.calculate_indicators(
+        ema_fast=settings.ema_short,
+        ema_slow=settings.ema_long,
+        ema_trend=settings.ema_trend,
+        rsi_period=settings.rsi_period,
+        adx_period=settings.adx_period
+    )
+    # The analyzer.df is updated inside calculate_indicators, so detect_rsi_divergence will see the new columns
+    df = analyzer.detect_rsi_divergence()
+    df = analyzer.detect_patterns()
+    df = analyzer.identify_structure()
+    
+    # Pattern Matcher (Similarity Search)
+    matcher = PatternMatcher(df)
+    bullish_edge, avg_corr = matcher.find_similarity()
+    
+    risk_calc = RiskCalculator(st.session_state.balance, risk_pct, rr_ratio)
+    df = risk_calc.calculate_chandelier_exit(df)
+
+    # Strategy
+    strat_settings = {
+        'rsi_overbought': settings.rsi_overbought,
+        'rsi_oversold': settings.rsi_oversold,
+        'volume_multiplier': settings.volume_multiplier,
+        'adx_threshold': settings.adx_threshold,
+        'ema_short': settings.ema_short,
+        'ema_long': settings.ema_long,
+        'ema_trend': settings.ema_trend
+    }
+    
+    fng_index = st.session_state.sentiment.get_fng_index()
+    strategy_class = ScalpingStrategy if strategy_type == "Scalping" else SwingStrategy
+    strategy = strategy_class(df, htf_df, strat_settings, regime=st.session_state.regime, sentiment=fng_index)
+    signal = strategy.generate_signal()
+    
+    if signal.type != SignalType.NEUTRAL:
+        st.toast(f"New {signal.type.value} Signal for {symbol}!", icon="🚀")
+        # Notify via Telegram if configured
+        st.session_state.notifier.notify_signal(symbol, signal.type.value, float(signal.debug_info['Score']), signal.score_breakdown)
+
+    # Update Portfolio Manager with current price data for SL/TP checks
+    # Pass Chandelier Exit for trailing stop if it exists
+    trailing_sl = None
+    if signal.type == SignalType.BUY and 'chandelier_long' in df.columns:
+        trailing_sl = df.iloc[-1]['chandelier_long']
+    elif signal.type == SignalType.SELL and 'chandelier_short' in df.columns:
+        trailing_sl = df.iloc[-1]['chandelier_short']
+        
+    st.session_state.pm.update_positions(symbol, last_price, df.iloc[-1]['high'], df.iloc[-1]['low'], trailing_sl=trailing_sl)
+
+    # UI Layout
+    col1, col2 = st.columns([1, 1])
+    
+    last_row = df.iloc[-1]
+    
+    with col1:
+        st.subheader("Market Analysis")
+        st.markdown(f"**Current TF:** {timeframe} | **HTF:** {htf}")
+        
+        # Display Efficiency & Historical Edge
+        er = last_row.get('efficiency_ratio', 0)
+        er_status = "✅ Efficient" if er > 0.3 else "⚠️ Choppy (Noisy)"
+        st.markdown(f"**Efficiency Ratio:** {er:.2f} ({er_status})")
+        st.markdown(f"**Historical Edge:** {bullish_edge*100:.1f}% Bullish (Match: {avg_corr*100:.1f}%)")
+
+        signal_color = "green" if signal.type == SignalType.BUY else "red" if signal.type == SignalType.SELL else "gray"
+        st.markdown(f"### Signal: :{signal_color}[{signal.type.value}]")
+        st.info(f"**Reason:** {signal.reason}")
+        
+        if signal.debug_info:
+            with st.expander("🔍 Strategy State Debug", expanded=True):
+                for key, value in signal.debug_info.items():
+                    st.write(f"**{key}:** {value}")
+                if signal.score_breakdown:
+                    st.divider()
+                    st.write("**Score Breakdown:**")
+                    for k, v in signal.score_breakdown.items():
+                        st.write(f"- {k}: +{v}")
+        
+        if 'is_squeeze' in df.columns and df.iloc[-1]['is_squeeze']:
+            st.warning("⚠️ VOLATILITY SQUEEZE DETECTED: Bollinger Bands inside Keltner Channels. Expect a big move!")
+        
+        # Squeeze Status Debug
+        st.markdown("**Squeeze Status:**")
+        if last_row.get('squeeze_breakout_long'):
+            st.success("Fired Long 🚀")
+        elif last_row.get('squeeze_breakout_short'):
+            st.error("Fired Short 📉")
+        elif last_row.get('is_squeeze'):
+            st.warning("In Squeeze 🟠")
+        else:
+            st.info("No Squeeze ⚪")
+
+    # Prep signal data for plotter
+    signal_data = None
+    last_price = df.iloc[-1]['close']
+    
+    # Safety check for ATR
+    if 'ATR' in df.columns and not pd.isna(df.iloc[-1]['ATR']):
+        last_atr = df.iloc[-1]['ATR']
+    else:
+        # Fallback: 1% of price as a rough ATR estimate if missing
+        last_atr = last_price * 0.01
+        logger.warning(f"ATR missing for {symbol}, using fallback (1% of price)")
+
+    sl, tp = risk_calc.calculate_levels(
+        last_price, last_atr, signal.type.value, 
+        atr_multiplier=settings.atr_multiplier,
+        entry_type=signal.debug_info.get('entry_type') if signal.debug_info else None
+    )
+
+    if signal.type != SignalType.NEUTRAL:
+        signal_data = {'type': signal.type.value, 'entry': last_price, 'sl': sl, 'tp': tp}
+
+    with col2:
+        st.subheader("Risk & Position Sizing")
+        if signal.type != SignalType.NEUTRAL:
+            pos_value, quantity = risk_calc.calculate_position_size(last_price, sl, strength=signal.strength)
+            
+            st.success(f"**Entry:** {last_price}")
+            st.error(f"**Stop-Loss:** {sl}")
+            st.info(f"**Take-Profit:** {tp}")
+            st.write(f"**Position Size (Adjusted):** {pos_value} USDT")
+            st.write(f"**Quantity:** {quantity} {symbol.split('/')[0]}")
+            
+            # Paper Trading Execute
+            st.write("**Simulate Trade on Portfolios:**")
+            p_cols = st.columns(3)
+            portfolios = st.session_state.pm.get_portfolios()
+            risk_mult = st.session_state.regime.get_risk_multiplier()
+            er = last_row.get('efficiency_ratio', 1.0)
+            
+            for idx, (_, p) in enumerate(portfolios.iterrows()):
+                if p_cols[idx].button(f"Simulate {p['name']}", key=f"sim_{p['id']}"):
+                    success = st.session_state.pm.open_position(
+                        p['id'], symbol, signal.type.value, last_price, sl, tp,
+                        notes=f"Strategy: {strategy_type}",
+                        risk_multiplier=risk_mult,
+                        score_breakdown=signal.score_breakdown,
+                        efficiency_ratio=er
+                    )
+                    if success:
+                        st.success(f"Executed on {p['name']} (Risk Mult: {risk_mult})")
+                    else:
+                        st.error(f"Failed to execute on {p['name']}")
+
+            if st.button("Simulate on ALL Profiles"):
+                for _, p in portfolios.iterrows():
+                    st.session_state.pm.open_position(
+                        p['id'], symbol, signal.type.value, last_price, sl, tp,
+                        notes=f"Strategy: {strategy_type}",
+                        risk_multiplier=risk_mult,
+                        score_breakdown=signal.score_breakdown,
+                        efficiency_ratio=er
+                    )
+                st.success(f"Executed on ALL profiles (Risk Mult: {risk_mult})")
+        else:
+            st.write("Waiting for confluence...")
+            
+        st.write(f"**Paper Balance:** {st.session_state.balance:.2f} USDT")
+
+    # Paper Trading Dashboard
+    if st.session_state.trades:
+        with st.expander("📂 Active Paper Trades", expanded=False):
+            for i, trade in enumerate(st.session_state.trades):
+                if trade['status'] == 'OPEN':
+                    # Simple PnL calc based on current price
+                    curr_pnl = (last_price - trade['entry']) * trade['quantity'] if trade['type'] == 'BUY' else (trade['entry'] - last_price) * trade['quantity']
+                    st.write(f"{trade['symbol']} {trade['type']} @ {trade['entry']} | PnL: {curr_pnl:.2f} USDT")
+                    if st.button(f"Close Trade {i}", key=f"close_{i}"):
+                        st.session_state.balance += curr_pnl
+                        trade['status'] = 'CLOSED'
+                        st.rerun()
+
+    # Chart
+    st.divider()
+    chart_builder = ChartBuilder(df)
+    fig = chart_builder.build_chart(symbol, sr_zones=analyzer.sr_zones, show_heikin=show_heikin, signal_data=signal_data)
+    st.plotly_chart(fig, width="stretch")
+
+def render_portfolio_tab():
+    st.subheader("💼 Multi-Profile Paper Trading System")
+    
+    pm = st.session_state.pm
+    portfolios = pm.get_portfolios()
+    
+    # Institutional Overview Cards
+    cols = st.columns(len(portfolios))
+    for i, (_, p) in enumerate(portfolios.iterrows()):
+        p_id = p['id']
+        stats = pm.calculate_advanced_stats(p_id)
+        total_pnl_pct = ((p['current_balance'] - p['initial_balance']) / p['initial_balance']) * 100
+        
+        with cols[i]:
+            st.metric(p['name'], f"{p['current_balance']:.2f} USDT", f"{total_pnl_pct:.2f}%")
+            st.write(f"**Win Rate:** {stats.get('WinRate', 0)}%")
+            st.write(f"**Profit Factor:** {stats.get('PF', 0)}")
+            st.write(f"**Max Drawdown:** {stats.get('DD', 0)}%")
+            st.write(f"**Sharpe Ratio:** {stats.get('Sharpe', 0)}")
+            st.write(f"**Expectancy:** {stats.get('Expectancy', 0)}")
+
+    # Active Trades
+    st.divider()
+    st.subheader("🔍 Open Positions")
+    open_trades = pm.db.fetch_all("SELECT * FROM trades WHERE status IN ('OPEN', 'PARTIAL')")
+    if not open_trades.empty:
+        st.dataframe(open_trades, width="stretch")
+        if st.button("Refresh PnL & Close Checks"):
+            st.rerun()
+    else:
+        st.write("No active trades.")
+
+    # Trade History (Audit Trail)
+    st.divider()
+    st.subheader("📜 Trade History (Audit Trail)")
+    history = pm.db.fetch_all("SELECT * FROM trades WHERE status LIKE 'CLOSED%' ORDER BY exit_time DESC")
+    if not history.empty:
+        for _, trade in history.iterrows():
+            with st.expander(f"Trade #{trade['id']}: {trade['symbol']} | {trade['direction']} | PnL: {trade['pnl']:.2f} USDT"):
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    st.write(f"**Entry Price:** {trade['entry_price']}")
+                    st.write(f"**Exit Price:** {trade['exit_price']}")
+                    st.write(f"**Quantity:** {trade['quantity']}")
+                    st.write(f"**Status:** {trade['status']}")
+                with col_b:
+                    st.write(f"**Entry Time:** {trade['entry_time']}")
+                    st.write(f"**Exit Time:** {trade['exit_time']}")
+                    st.write(f"**Notes:** {trade['notes']}")
+                
+                if trade.get('score_breakdown'):
+                    st.divider()
+                    st.write("**Institutional Score Breakdown:**")
+                    try:
+                        breakdown = json.loads(trade['score_breakdown'])
+                        for k, v in breakdown.items():
+                            st.write(f"- {k}: +{v}")
+                    except:
+                        st.write(trade['score_breakdown'])
+    else:
+        st.write("No trade history yet.")
+
+    # Trade Logs (Near Miss)
+    st.divider()
+    with st.expander("📝 Near Miss Logs"):
+        logs = pm.db.fetch_all("SELECT * FROM trade_logs ORDER BY timestamp DESC LIMIT 50")
+        if not logs.empty:
+            st.dataframe(logs, width="stretch")
+        else:
+            st.write("No logs recorded.")
+
+if __name__ == "__main__":
+    main()
