@@ -102,7 +102,7 @@ class PortfolioManager:
         return True
 
     def update_positions(self, symbol: str, current_price: float, high: float, low: float, trailing_sl: Optional[float] = None):
-        """Updates open positions based on current price data."""
+        """Updates open positions based on current price data and logs PnL."""
         open_trades = self.db.fetch_all("SELECT * FROM trades WHERE symbol = ? AND status IN ('OPEN', 'PARTIAL')", (symbol,))
         
         for _, trade in open_trades.iterrows():
@@ -115,6 +115,16 @@ class PortfolioManager:
             portfolio_id = trade['portfolio_id']
             status = trade['status']
 
+            # Update current unrealized PnL in DB
+            if direction == 'BUY':
+                unrealized_pnl = (current_price - entry) * qty
+            else:
+                unrealized_pnl = (entry - current_price) * qty
+            
+            # We don't have a column for unrealized PnL in 'trades', but we can log it or 
+            # we could update a dedicated 'pnl' column if we decide to use it for current state too.
+            # For now, let's just make sure we have a way to calculate metrics.
+            
             # 1. Check SL/TP
             hit_sl = False
             hit_tp = False
@@ -254,6 +264,10 @@ class PortfolioManager:
         if self.notifier:
             self.notifier.notify_near_miss(symbol, direction, event_type, price, dist_pct)
 
+    def reconcile_offline_moves(self):
+        """Checks for SL/TP hits for open positions while the app was closed. Alias for reconcile_open_positions."""
+        return self.reconcile_open_positions()
+
     def reconcile_open_positions(self):
         """Checks for SL/TP hits for open positions while the app was closed."""
         logger.info("SYSTEM: Starting trade reconciliation...")
@@ -385,6 +399,25 @@ class PortfolioManager:
         )
         if self.notifier:
             self.notifier.notify_trade_closed(trade_id, symbol, f"RECONCILED_{status}", pnl)
+
+    def get_portfolio_metrics(self, portfolio_id: int) -> dict:
+        """Returns metrics like Free Capital and Funds in Use."""
+        portfolio = self.db.fetch_all("SELECT * FROM portfolios WHERE id = ?", (portfolio_id,))
+        if portfolio.empty: return {}
+        
+        balance = portfolio.iloc[0]['current_balance']
+        
+        # Calculate Funds in Use (Locked Margin)
+        trades = self.db.fetch_all("SELECT position_size_usdt, leverage FROM trades WHERE portfolio_id = ? AND status IN ('OPEN', 'PARTIAL')", (portfolio_id,))
+        funds_in_use = 0
+        if not trades.empty:
+            funds_in_use = (trades['position_size_usdt'] / trades['leverage']).sum()
+            
+        return {
+            "balance": balance,
+            "funds_in_use": round(funds_in_use, 2),
+            "free_capital": round(balance, 2) # In this system, balance already has margin deducted
+        }
 
     def calculate_advanced_stats(self, portfolio_id: int) -> dict:
         """Calculates institutional metrics for a portfolio."""

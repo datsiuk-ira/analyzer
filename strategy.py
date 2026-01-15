@@ -91,22 +91,26 @@ class ScalpingStrategy(BaseStrategy):
         # 1. Trend Alignment
         ema_trend = last_row.get('EMA_TREND')
         if not pd.isna(ema_trend) and ema_trend != 0:
-            if last_row['close'] > ema_trend: long_score_map['Trend'] = 1.0
-            if last_row['close'] < ema_trend: short_score_map['Trend'] = 1.0
+            if last_row['close'] > ema_trend: long_score_map['Trend'] = 1.5
+            if last_row['close'] < ema_trend: short_score_map['Trend'] = 1.5
         
-        # 2. RSI Crossover
+        # 2. MTF Filter (Higher Timeframe Trend Alignment - Higher Weight)
+        if htf_info == "Bullish": long_score_map['MTF_Trend'] = 2.0
+        if htf_info == "Bearish": short_score_map['MTF_Trend'] = 2.0
+        
+        # 3. RSI Crossover
         if rsi_crossed_up: long_score_map['RSI_Cross'] = 1.0
         if rsi_crossed_down: short_score_map['RSI_Cross'] = 1.0
         
-        # 3. RSI Divergence
+        # 4. RSI Divergence
         if has_bull_div: long_score_map['RSI_Div'] = 2.0
         if has_bear_div: short_score_map['RSI_Div'] = 2.0
         
-        # 4. SFP Pattern (Institutional)
+        # 5. SFP Pattern (Institutional)
         if last_row.get('bullish_sfp'): long_score_map['SFP'] = 2.5
         if last_row.get('bearish_sfp'): short_score_map['SFP'] = 2.5
 
-        # 5. Squeeze Breakout (Reduced Priority)
+        # 5b. Squeeze Breakout (Reduced Priority)
         if sq_break_long: long_score_map['Squeeze'] = 1.5
         if sq_break_short: short_score_map['Squeeze'] = 1.5
         
@@ -142,6 +146,19 @@ class ScalpingStrategy(BaseStrategy):
             btc_return = (btc_df['close'].iloc[-1] / btc_df['close'].iloc[-12]) - 1
             if sym_return > btc_return: long_score_map['RS'] = 1.0
             if sym_return < btc_return: short_score_map['RS'] = 1.0
+
+        # 11. New Patterns: Double Bottom/Top, H&S
+        if last_row.get('pattern_double_bottom'): long_score_map['Double_Bottom'] = 2.0
+        if last_row.get('pattern_double_top'): short_score_map['Double_Top'] = 2.0
+        if last_row.get('pattern_inv_head_shoulders'): long_score_map['Inv_H&S'] = 3.0
+        if last_row.get('pattern_head_shoulders'): short_score_map['H&S'] = 3.0
+
+        # 12. Stochastic RSI Confluence
+        stoch_k_cols = [c for c in self.df.columns if c.startswith('STOCHRSIk_')]
+        if stoch_k_cols:
+            stoch_k = last_row[stoch_k_cols[0]]
+            if stoch_k < 20: long_score_map['Stoch_RSI'] = 0.5
+            if stoch_k > 80: short_score_map['Stoch_RSI'] = 0.5
 
         long_score = sum(long_score_map.values())
         short_score = sum(short_score_map.values())
@@ -268,6 +285,17 @@ class SwingStrategy(BaseStrategy):
             btc_return = (btc_df['close'].iloc[-1] / btc_df['close'].iloc[-12]) - 1
             if sym_return > btc_return: long_score_map['RS'] = 1.0
             if sym_return < btc_return: short_score_map['RS'] = 1.0
+
+        # 8. New Patterns: Double Bottom/Top
+        if last_row.get('pattern_double_bottom'): long_score_map['Double_Bottom'] = 2.0
+        if last_row.get('pattern_double_top'): short_score_map['Double_Top'] = 2.0
+
+        # 9. Stochastic RSI Confluence
+        stoch_k_cols = [c for c in self.df.columns if c.startswith('STOCHRSIk_')]
+        if stoch_k_cols:
+            stoch_k = last_row[stoch_k_cols[0]]
+            if stoch_k < 20: long_score_map['Stoch_RSI'] = 0.5
+            if stoch_k > 80: short_score_map['Stoch_RSI'] = 0.5
 
         long_score = sum(long_score_map.values())
         short_score = sum(short_score_map.values())

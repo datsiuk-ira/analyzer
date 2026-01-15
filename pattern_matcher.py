@@ -17,6 +17,12 @@ class PatternMatcher:
         Scans history for similar normalized price sequences.
         Returns (historical_edge_bullish_pct, avg_correlation).
         """
+        return self.find_similar_patterns()
+
+    def find_similar_patterns(self) -> Tuple[float, float]:
+        """
+        Alias for find_similarity used by app.py.
+        """
         if len(self.df) < self.window_size + 5:
             return 0.0, 0.0
 

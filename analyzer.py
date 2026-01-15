@@ -18,7 +18,11 @@ class MarketAnalyzer:
                              ema_trend: int = 200, 
                              rsi_period: int = 14, 
                              atr_period: int = 14,
-                             adx_period: int = 14) -> pd.DataFrame:
+                             adx_period: int = 14,
+                             stoch_rsi_period: int = 14,
+                             stoch_period: int = 14,
+                             stoch_k: int = 3,
+                             stoch_d: int = 3) -> pd.DataFrame:
         """
         Calculates technical indicators using pandas_ta with verbose debugging.
         """
@@ -175,8 +179,29 @@ class MarketAnalyzer:
                 # Delta = TakerBuyVol - (TotalVol - TakerBuyVol)
                 df['delta'] = df['taker_buy_vol'] - (df['volume'] - df['taker_buy_vol'])
                 df['CVD'] = df['delta'].cumsum()
+            
+            # Ichimoku Cloud
+            try:
+                ichimoku, _ = ta.ichimoku(df['high'], df['low'], df['close'])
+                if ichimoku is not None:
+                    df = pd.concat([df, ichimoku], axis=1)
+                else:
+                    logger.warning("ta.ichimoku returned None")
+            except Exception as e:
+                logger.error(f"Error calculating Ichimoku: {e}")
+
+            # Stochastic RSI
+            try:
+                stoch_rsi = ta.stochrsi(df['close'], length=stoch_rsi_period, rsi_length=rsi_period, k=stoch_k, d=stoch_d)
+                if stoch_rsi is not None:
+                    df = pd.concat([df, stoch_rsi], axis=1)
+                else:
+                    logger.warning("ta.stochrsi returned None")
+            except Exception as e:
+                logger.error(f"Error calculating Stochastic RSI: {e}")
+
         except Exception as e:
-            logger.error(f"Error calculating squeeze or CVD: {e}")
+            logger.error(f"Error calculating indicators: {e}")
             df['is_squeeze'] = False
             df['squeeze_breakout_long'] = False
             df['squeeze_breakout_short'] = False
@@ -258,8 +283,10 @@ class MarketAnalyzer:
     def detect_patterns(self) -> pd.DataFrame:
         """
         Detects candlestick patterns (Engulfing and Pinbar) manually for performance.
+        Also detects chart patterns like Double Top/Bottom.
         """
-        # 1. Engulfing Logic
+        # 1. Candlestick Patterns
+        # Engulfing Logic
         # Bullish Engulfing: Previous candle red, current green, current body engulfs previous body
         prev_open = self.df['open'].shift(1)
         prev_close = self.df['close'].shift(1)
@@ -280,19 +307,83 @@ class MarketAnalyzer:
         self.df.loc[bull_engulfing, 'pattern_engulfing'] = 100
         self.df.loc[bear_engulfing, 'pattern_engulfing'] = -100
         
-        # 2. Pinbar logic
+        # Pinbar logic
         body_size = (self.df['close'] - self.df['open']).abs()
         range_size = self.df['high'] - self.df['low']
         upper_wick = self.df['high'] - self.df[['open', 'close']].max(axis=1)
         lower_wick = self.df[['open', 'close']].min(axis=1) - self.df['low']
         
         # Avoid division by zero
-        body_size = body_size.replace(0, 0.000001)
+        body_size_fixed = body_size.replace(0, 0.000001)
         
-        self.df['is_pinbar_bullish'] = (lower_wick > body_size * 2) & (upper_wick < body_size)
-        self.df['is_pinbar_bearish'] = (upper_wick > body_size * 2) & (lower_wick < body_size)
+        self.df['is_pinbar_bullish'] = (lower_wick > body_size_fixed * 2) & (upper_wick < body_size_fixed)
+        self.df['is_pinbar_bearish'] = (upper_wick > body_size_fixed * 2) & (lower_wick < body_size_fixed)
+
+        # 2. Chart Patterns: Double Top/Bottom
+        self.detect_chart_patterns()
         
         return self.df
+
+    def detect_chart_patterns(self, window: int = 5) -> None:
+        """
+        Detects Double Bottom (W), Double Top (M), Head & Shoulders, and Wedges.
+        """
+        # Initialize columns
+        self.df['pattern_double_bottom'] = False
+        self.df['pattern_double_top'] = False
+        self.df['pattern_head_shoulders'] = False
+        self.df['pattern_inv_head_shoulders'] = False
+
+        # Use rolling to find local peaks/valleys
+        is_local_low = (self.df['low'] == self.df['low'].rolling(window=window*2+1, center=True).min())
+        is_local_high = (self.df['high'] == self.df['high'].rolling(window=window*2+1, center=True).max())
+
+        low_pivots = self.df[is_local_low].copy()
+        high_pivots = self.df[is_local_high].copy()
+
+        # 1. Double Bottom / Top (Existing logic)
+        if len(low_pivots) > 1:
+            low_pivots['prev_low'] = low_pivots['low'].shift(1)
+            price_threshold = 0.03
+            is_w = (abs(low_pivots['low'] - low_pivots['prev_low']) / low_pivots['prev_low']) <= price_threshold
+            for idx in low_pivots[is_w].index:
+                prev_indices = low_pivots.index[low_pivots.index < idx]
+                if len(prev_indices) > 0:
+                    prev_idx = prev_indices[-1]
+                    mid_data = self.df.loc[prev_idx:idx]
+                    if len(mid_data) > 2:
+                        peak = mid_data['high'].max()
+                        if peak > low_pivots.loc[idx, 'low'] * 1.01:
+                            self.df.at[idx, 'pattern_double_bottom'] = True
+
+        if len(high_pivots) > 1:
+            high_pivots['prev_high'] = high_pivots['high'].shift(1)
+            price_threshold = 0.03
+            is_m = (abs(high_pivots['high'] - high_pivots['prev_high']) / high_pivots['prev_high']) <= price_threshold
+            for idx in high_pivots[is_m].index:
+                prev_indices = high_pivots.index[high_pivots.index < idx]
+                if len(prev_indices) > 0:
+                    prev_idx = prev_indices[-1]
+                    mid_data = self.df.loc[prev_idx:idx]
+                    if len(mid_data) > 2:
+                        valley = mid_data['low'].min()
+                        if valley < high_pivots.loc[idx, 'high'] * 0.99:
+                            self.df.at[idx, 'pattern_double_top'] = True
+
+        # 2. Head & Shoulders
+        if len(high_pivots) >= 3:
+            # Look at last 3 high pivots
+            last_3 = high_pivots.tail(3)
+            h1, h2, h3 = last_3['high'].values
+            if h2 > h1 and h2 > h3 and abs(h1 - h3) / h1 < 0.03:
+                self.df.at[last_3.index[-1], 'pattern_head_shoulders'] = True
+
+        # 3. Inverted Head & Shoulders
+        if len(low_pivots) >= 3:
+            last_3 = low_pivots.tail(3)
+            l1, l2, l3 = last_3['low'].values
+            if l2 < l1 and l2 < l3 and abs(l1 - l3) / l1 < 0.03:
+                self.df.at[last_3.index[-1], 'pattern_inv_head_shoulders'] = True
 
     def identify_structure(self, window: int = 5) -> pd.DataFrame:
         """

@@ -2,6 +2,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import pandas as pd
 import pandas_ta as ta
+import numpy as np
 from typing import List, Dict, Any
 
 class ChartBuilder:
@@ -13,7 +14,8 @@ class ChartBuilder:
 
     def build_chart(self, symbol: str, sr_zones: List[Dict[str, Any]] = None, 
                     show_heikin: bool = False, 
-                    signal_data: Dict[str, Any] = None) -> go.Figure:
+                    signal_data: Dict[str, Any] = None,
+                    show_projection: bool = False) -> go.Figure:
         """
         Creates a comprehensive multi-panel chart with subplots for Indicators.
         """
@@ -43,6 +45,38 @@ class ChartBuilder:
             low=df['low'], close=df['close'],
             name="Price"
         ), row=1, col=1)
+
+        # 1d. Linear Regression Channel / Projection
+        if show_projection and len(df) > 20:
+            y = df['close'].values
+            x = np.arange(len(y))
+            # Fit polynomial (degree 1 for linear regression, 2 for poly)
+            poly = np.polyfit(x, y, 2)
+            poly_func = np.poly1d(poly)
+            
+            # Project 10 candles
+            future_x = np.arange(len(y), len(y) + 10)
+            future_y = poly_func(future_x)
+            
+            # Use last timestamp to generate future timestamps
+            last_ts = df['timestamp'].iloc[-1]
+            freq = pd.infer_freq(df['timestamp']) or '5min'
+            future_ts = pd.date_range(start=last_ts, periods=11, freq=freq)[1:]
+            
+            fig.add_trace(go.Scatter(
+                x=future_ts, y=future_y, 
+                name="Poly Projection (deg 2)", 
+                line=dict(color='cyan', dash='dash', width=2)
+            ), row=1, col=1)
+
+        # 1c. Ichimoku Cloud
+        if 'ISA_9' in df.columns and 'ISB_26' in df.columns:
+            fig.add_trace(go.Scatter(x=df['timestamp'], y=df['ISA_9'], name="Span A", line=dict(color='rgba(0, 255, 0, 0.3)', width=1), showlegend=False), row=1, col=1)
+            fig.add_trace(go.Scatter(x=df['timestamp'], y=df['ISB_26'], name="Span B", line=dict(color='rgba(255, 0, 0, 0.3)', width=1), fill='tonexty', fillcolor='rgba(128, 128, 128, 0.1)', showlegend=False), row=1, col=1)
+        if 'ITS_9' in df.columns:
+            fig.add_trace(go.Scatter(x=df['timestamp'], y=df['ITS_9'], name="Tenkan-sen", line=dict(color='blue', width=1)), row=1, col=1)
+        if 'IKS_26' in df.columns:
+            fig.add_trace(go.Scatter(x=df['timestamp'], y=df['IKS_26'], name="Kijun-sen", line=dict(color='red', width=1)), row=1, col=1)
 
         # 1b. Squeeze Background
         if 'is_squeeze' in df.columns:
@@ -118,11 +152,28 @@ class ChartBuilder:
         if 'swing_low' in self.df.columns:
             fig.add_trace(go.Scatter(x=self.df['timestamp'], y=self.df['swing_low'], mode='markers', marker=dict(symbol='triangle-up', color='white', size=8), name='Swing Low'), row=1, col=1)
 
+        # Double Top/Bottom Markers
+        if 'pattern_double_top' in self.df.columns:
+            dtops = self.df[self.df['pattern_double_top'] == True]
+            if not dtops.empty:
+                fig.add_trace(go.Scatter(x=dtops['timestamp'], y=dtops['high'] * 1.01, mode='markers+text', text=["Double Top"]*len(dtops), textposition="top center", marker=dict(symbol='diamond', color='red', size=12), name='Double Top'), row=1, col=1)
+        if 'pattern_double_bottom' in self.df.columns:
+            dbottoms = self.df[self.df['pattern_double_bottom'] == True]
+            if not dbottoms.empty:
+                fig.add_trace(go.Scatter(x=dbottoms['timestamp'], y=dbottoms['low'] * 0.99, mode='markers+text', text=["Double Bottom"]*len(dbottoms), textposition="bottom center", marker=dict(symbol='diamond', color='green', size=12), name='Double Bottom'), row=1, col=1)
+
         # 2. RSI & ADX
         if 'RSI' in self.df.columns:
             fig.add_trace(go.Scatter(x=self.df['timestamp'], y=self.df['RSI'], name="RSI", line=dict(color='purple')), row=2, col=1)
             fig.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1)
             fig.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1)
+            
+            # Stochastic RSI
+            stoch_k_cols = [c for c in self.df.columns if c.startswith('STOCHRSIk_')]
+            stoch_d_cols = [c for c in self.df.columns if c.startswith('STOCHRSId_')]
+            if stoch_k_cols and stoch_d_cols:
+                fig.add_trace(go.Scatter(x=self.df['timestamp'], y=self.df[stoch_k_cols[0]], name="Stoch RSI K", line=dict(color='rgba(255, 255, 255, 0.5)', dash='dot')), row=2, col=1)
+                fig.add_trace(go.Scatter(x=self.df['timestamp'], y=self.df[stoch_d_cols[0]], name="Stoch RSI D", line=dict(color='rgba(255, 255, 0, 0.5)', dash='dot')), row=2, col=1)
             
             # Divergence Marks
             bull_divs = self.df[self.df['bullish_div'] == True]

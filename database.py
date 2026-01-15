@@ -18,8 +18,9 @@ class DatabaseManager:
     def _get_connection(self):
         # SQLite connection must be created per thread if not using check_same_thread=False
         # Since Streamlit is multi-threaded, we handle it carefully.
+        # check_same_thread=False is used to allow sharing between UI and background scanner.
         if self._conn is None:
-            self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            self._conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=10)
         return self._conn
 
     def _init_db(self):
@@ -75,6 +76,18 @@ class DatabaseManager:
                 FOREIGN KEY (trade_id) REFERENCES trades(id)
             )
         ''')
+
+        # Signal History for Confidence Scoring
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS signal_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                timeframe TEXT NOT NULL,
+                signal_type TEXT NOT NULL,
+                score REAL NOT NULL,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
         
         conn.commit()
         logger.info("Database initialized successfully.")
@@ -82,6 +95,8 @@ class DatabaseManager:
     def execute_query(self, query: str, params: tuple = ()):
         conn = self._get_connection()
         try:
+            # Enable WAL mode for better concurrency
+            conn.execute("PRAGMA journal_mode=WAL")
             cursor = conn.cursor()
             cursor.execute(query, params)
             conn.commit()

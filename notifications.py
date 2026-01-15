@@ -1,4 +1,5 @@
-import requests
+import telebot
+from telebot import types
 from logger import logger
 import json
 from typing import Optional
@@ -6,47 +7,33 @@ from config import settings
 
 class NotificationManager:
     """
-    Handles outgoing notifications (e.g., Telegram) synchronously.
+    Handles outgoing notifications (e.g., Telegram) and interactive buttons.
     """
     def __init__(self, token: Optional[str] = None, chat_id: Optional[str] = None):
         self.token = token or settings.telegram_bot_token
         self.chat_id = chat_id or settings.telegram_chat_id
-        self.api_url = f"https://api.telegram.org/bot{self.token}/sendMessage" if self.token else None
+        self.bot = telebot.TeleBot(self.token) if self.token else None
 
-    def _send_telegram(self, message: str) -> dict:
-        if not self.token or not self.chat_id:
+    def _send_telegram(self, message: str, reply_markup: Optional[types.InlineKeyboardMarkup] = None) -> dict:
+        if not self.token or not self.chat_id or not self.bot:
             msg = "Telegram credentials missing. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env"
             logger.debug(msg)
             return {"success": False, "message": msg}
 
         try:
-            payload = {
-                "chat_id": self.chat_id,
-                "text": message,
-                "parse_mode": "Markdown"
-            }
-            response = requests.post(self.api_url, json=payload, timeout=5)
-            
-            if response.status_code == 200:
-                return {"success": True, "message": "Sent successfully!"}
-            
-            error_msg = f"HTTP {response.status_code}: {response.text}"
-            if response.status_code == 403:
-                error_msg = "Telegram Error: Bot cannot chat with Bot. Please update .env with your User ID."
-                logger.error(f"Telegram notification failed (403): {error_msg} Response: {response.text}")
-            elif response.status_code == 400:
-                error_msg = f"Bad Request (400): {response.text}"
-                logger.error(f"Telegram notification failed (400): {error_msg}")
-            else:
-                logger.error(f"Telegram notification failed (Status {response.status_code}): {response.text}")
-                
-            return {"success": False, "message": error_msg}
-        except requests.exceptions.Timeout:
-            logger.error("Telegram notification timeout")
-            return {"success": False, "message": "Connection timeout"}
+            self.bot.send_message(
+                chat_id=self.chat_id,
+                text=message,
+                parse_mode="Markdown",
+                reply_markup=reply_markup
+            )
+            return {"success": True, "message": "Sent successfully!"}
         except Exception as e:
-            logger.error(f"Error sending Telegram notification: {e}")
-            return {"success": False, "message": f"Exception: {str(e)}"}
+            error_msg = str(e)
+            if "403" in error_msg:
+                error_msg = "Telegram Error: Bot cannot chat with Bot. Please update .env with your User ID."
+            logger.error(f"Telegram notification failed: {error_msg}")
+            return {"success": False, "message": error_msg}
 
     def notify(self, message: str) -> dict:
         """
@@ -56,11 +43,7 @@ class NotificationManager:
             logger.info(f"Notification (Local): {message}")
             return {"success": True, "message": "Logged locally"}
             
-        try:
-            return self._send_telegram(message)
-        except Exception as e:
-            logger.error(f"Failed to send notification: {e}")
-            return {"success": False, "message": str(e)}
+        return self._send_telegram(message)
 
     def notify_trade_opened(self, symbol, direction, entry_price, size, stop_loss, take_profit, portfolio_name):
         """
@@ -87,9 +70,9 @@ class NotificationManager:
         )
         return self.notify(msg)
 
-    def notify_signal(self, symbol: str, signal_type: str, score: float, breakdown: dict, sl: float = 0.0, tp: float = 0.0):
+    def notify_signal(self, symbol: str, signal_type: str, score: float, breakdown: dict, sl: float = 0.0, tp: float = 0.0, signal_id: Optional[str] = None):
         """
-        Sends a detailed trade signal notification.
+        Sends a detailed trade signal notification with interactive buttons if signal_id is provided.
         """
         # Format breakdown items
         breakdown_items = [f"{k}: {v}" for k, v in breakdown.items() if v != 0 and k != 'Total']
@@ -106,7 +89,17 @@ class NotificationManager:
             f"SL: `{sl}` | TP: `{tp}`\n"
             f"Breakdown: {escape_md(breakdown_str)}"
         )
-        return self.notify(msg)
+
+        markup = None
+        if signal_id:
+            markup = types.InlineKeyboardMarkup()
+            markup.row(
+                types.InlineKeyboardButton("🐢 Conservative", callback_data=f"trade|{signal_id}|low"),
+                types.InlineKeyboardButton("⚖️ Moderate", callback_data=f"trade|{signal_id}|mid"),
+                types.InlineKeyboardButton("🚀 Aggressive", callback_data=f"trade|{signal_id}|high")
+            )
+
+        return self._send_telegram(msg, reply_markup=markup)
 
 
     def notify_regime_change(self, new_regime: str, risk_off: bool):
