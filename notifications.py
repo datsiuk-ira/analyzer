@@ -87,18 +87,27 @@ class NotificationManager:
         )
         return self.notify(msg)
 
-    def notify_signal(self, symbol: str, signal_type: str, score: float, breakdown: dict):
+    def notify_signal(self, symbol: str, signal_type: str, score: float, breakdown: dict, sl: float = 0.0, tp: float = 0.0):
         """
         Sends a detailed trade signal notification.
         """
-        breakdown_str = ", ".join([f"{k}: {v}" for k, v in breakdown.items() if v != 0 and k != 'Total'])
+        # Format breakdown items
+        breakdown_items = [f"{k}: {v}" for k, v in breakdown.items() if v != 0 and k != 'Total']
+        breakdown_str = ", ".join(breakdown_items)
+        
+        # We'll use a safer Markdown approach by escaping specific characters in data fields
+        def escape_md(text):
+            return str(text).replace("_", "\\_").replace("*", "\\*").replace("`", "\\`")
+
         msg = (
             f"🚀 *New Trade Signal*\n"
-            f"Entry: `{symbol}` | {signal_type}\n"
+            f"Entry: `{escape_md(symbol)}` | {escape_md(signal_type)}\n"
             f"Score: `{score}`\n"
-            f"Breakdown: _{breakdown_str}_"
+            f"SL: `{sl}` | TP: `{tp}`\n"
+            f"Breakdown: {escape_md(breakdown_str)}"
         )
-        self.notify(msg)
+        return self.notify(msg)
+
 
     def notify_regime_change(self, new_regime: str, risk_off: bool):
         """

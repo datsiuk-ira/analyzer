@@ -1,7 +1,7 @@
 import pandas as pd
 import asyncio
 import json
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from data_loader import BinanceFetcher
 from analyzer import MarketAnalyzer
 from strategy import ScalpingStrategy, SignalType
@@ -16,11 +16,14 @@ class MarketScreener:
         self.symbols = symbols
         self.timeframe = timeframe
 
-    async def scan_market(self, strat_settings: Dict[str, Any], top_limit: int = 50) -> pd.DataFrame:
+    async def scan_market(self, strat_settings: Dict[str, Any], top_limit: int = 50, fetcher: Optional[BinanceFetcher] = None) -> pd.DataFrame:
         """
         Scans top assets by volume and returns a summary dataframe sorted by score.
         """
-        fetcher = BinanceFetcher()
+        local_fetcher = False
+        if fetcher is None:
+            fetcher = BinanceFetcher()
+            local_fetcher = True
         try:
             # 1. Fetch Top 50 Volatile Pairs if no symbols provided
             if not self.symbols:
@@ -122,4 +125,5 @@ class MarketScreener:
                 
             return df_results.head(10)
         finally:
-            await fetcher.close()
+            if local_fetcher:
+                await fetcher.close()

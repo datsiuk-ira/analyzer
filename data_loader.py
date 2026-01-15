@@ -10,7 +10,7 @@ class DataFetcher(ABC):
     Abstract Base Class for fetching market data.
     """
     @abstractmethod
-    async def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int = 1000) -> pd.DataFrame:
+    async def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int = 1000, since: Optional[int] = None) -> pd.DataFrame:
         """
         Fetches OHLCV data for a given symbol and timeframe.
         """
@@ -28,12 +28,12 @@ class BinanceFetcher(DataFetcher):
             'enableRateLimit': True,
         })
 
-    async def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int = 1000) -> pd.DataFrame:
+    async def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int = 1000, since: Optional[int] = None) -> pd.DataFrame:
         """
         Fetches OHLCV data from Binance Futures asynchronously.
         """
         try:
-            ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+            ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit, since=since)
             if not ohlcv:
                 logger.warning(f"No data returned for {symbol} on {timeframe}")
                 return pd.DataFrame()

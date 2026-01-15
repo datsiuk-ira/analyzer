@@ -83,6 +83,11 @@ def main():
         st.session_state.pm = PortfolioManager(st.session_state.db, notifier=st.session_state.notifier)
         logger.info("Re-initialized PortfolioManager with notifier and leverage logic.")
     
+    # Run reconciliation on startup
+    if 'reconciled' not in st.session_state:
+        st.session_state.pm.reconcile_open_positions()
+        st.session_state.reconciled = True
+    
     if 'regime' not in st.session_state:
         st.session_state.regime = MarketRegime()
     

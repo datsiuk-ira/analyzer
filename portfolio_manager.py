@@ -254,6 +254,138 @@ class PortfolioManager:
         if self.notifier:
             self.notifier.notify_near_miss(symbol, direction, event_type, price, dist_pct)
 
+    def reconcile_open_positions(self):
+        """Checks for SL/TP hits for open positions while the app was closed."""
+        logger.info("SYSTEM: Starting trade reconciliation...")
+        open_trades = self.db.fetch_all("SELECT * FROM trades WHERE status IN ('OPEN', 'PARTIAL')")
+        if open_trades.empty:
+            logger.info("SYSTEM: No open trades to reconcile.")
+            return
+
+        from data_loader import BinanceFetcher
+        import asyncio
+
+        fetcher = BinanceFetcher()
+
+        async def _reconcile():
+            try:
+                for _, trade in open_trades.iterrows():
+                    symbol = trade['symbol']
+                    # Use entry_time as start (or we could use a last_reconcile_time if we had one)
+                    # entry_time is like '2026-01-14 19:18:22'
+                    entry_time_str = trade['entry_time']
+                    entry_dt = datetime.strptime(entry_time_str, '%Y-%m-%d %H:%M:%S')
+                    since_ms = int(entry_dt.timestamp() * 1000)
+
+                    # Fetch 1m candles for precise reconciliation
+                    logger.debug(f"RECONCILE: Fetching data for {symbol} since {entry_dt} ({since_ms})")
+                    df = await fetcher.fetch_ohlcv(symbol, timeframe='1m', limit=1000, since=since_ms)
+                    if df.empty:
+                        logger.debug(f"RECONCILE: No data returned for {symbol}")
+                        continue
+                    
+                    # Filter candles that happened AFTER entry_time (to be sure)
+                    df = df[df['timestamp'] > entry_dt]
+                    if df.empty:
+                        logger.debug(f"RECONCILE: No candles after entry_time for {symbol}")
+                        continue
+
+                    logger.debug(f"RECONCILE: Checking {len(df)} candles for {symbol}")
+
+                    for _, candle in df.iterrows():
+                        # Use the existing update_positions logic but with candle data
+                        # We need to call update_positions with symbol, current_price (close), high, low
+                        # But update_positions works on all trades for a symbol.
+                        # For reconciliation, it's better to have a version that handles a specific trade.
+                        
+                        hit_sl = False
+                        hit_tp = False
+                        exit_price = None
+                        
+                        direction = trade['direction']
+                        sl = trade['stop_loss']
+                        tp = trade['take_profit']
+                        entry = trade['entry_price']
+                        qty = trade['quantity']
+                        portfolio_id = trade['portfolio_id']
+                        trade_id = trade['id']
+                        status = trade['status']
+
+                        high = candle['high']
+                        low = candle['low']
+                        timestamp = candle['timestamp']
+
+                        if direction == 'BUY':
+                            if low <= sl:
+                                hit_sl = True
+                                exit_price = sl
+                            elif high >= tp and status == 'OPEN':
+                                hit_tp = True
+                                exit_price = tp
+                        else: # SELL
+                            if high >= sl:
+                                hit_sl = True
+                                exit_price = sl
+                            elif low <= tp and status == 'OPEN':
+                                hit_tp = True
+                                exit_price = tp
+
+                        if hit_sl:
+                            pnl = (exit_price - entry) * qty if direction == 'BUY' else (entry - exit_price) * qty
+                            # Special close for reconciliation to set the correct exit_time
+                            self._close_reconciled_trade(trade_id, portfolio_id, exit_price, pnl, 'CLOSED_SL', symbol, timestamp)
+                            logger.info(f"RECONCILE: Trade {trade_id} ({symbol}) hit SL at {timestamp}")
+                            break # Trade closed
+                        
+                        if hit_tp and status == 'OPEN':
+                            # TP1 Hit
+                            pnl_half = ((tp - entry) * (qty * 0.5)) if direction == 'BUY' else ((entry - tp) * (qty * 0.5))
+                            pos_size_half = trade['position_size_usdt'] * 0.5
+                            lev = trade.get('leverage', self.LEVERAGE)
+                            margin_cost_half = pos_size_half / lev
+                            
+                            self.db.execute_query(
+                                "UPDATE trades SET quantity = ?, status = 'PARTIAL', stop_loss = ?, pnl = COALESCE(pnl, 0) + ?, position_size_usdt = ? WHERE id = ?",
+                                (qty * 0.5, entry, pnl_half, pos_size_half, trade_id)
+                            )
+                            return_amount = margin_cost_half + pnl_half
+                            self.db.execute_query(
+                                "UPDATE portfolios SET current_balance = current_balance + ? WHERE id = ?",
+                                (return_amount, portfolio_id)
+                            )
+                            logger.info(f"RECONCILE: Trade {trade_id} ({symbol}) hit TP1 at {timestamp}")
+                            # Update local trade state for further candles
+                            trade['status'] = 'PARTIAL'
+                            trade['quantity'] = qty * 0.5
+                            trade['stop_loss'] = entry
+                            trade['position_size_usdt'] = pos_size_half
+                            # Continue checking this trade for SL hit on later candles
+            finally:
+                await fetcher.close()
+
+        asyncio.run(_reconcile())
+
+    def _close_reconciled_trade(self, trade_id, portfolio_id, exit_price, pnl, status, symbol, exit_time):
+        """Internal helper for reconciliation to set specific exit time."""
+        trade = self.db.fetch_all("SELECT position_size_usdt, status, leverage FROM trades WHERE id = ?", (trade_id,))
+        if trade.empty: return
+
+        pos_size = trade.iloc[0]['position_size_usdt']
+        lev = trade.iloc[0]['leverage'] if trade.iloc[0]['leverage'] else self.LEVERAGE
+        margin_cost = pos_size / lev
+
+        self.db.execute_query(
+            "UPDATE trades SET status = ?, exit_time = ?, exit_price = ?, pnl = COALESCE(pnl, 0) + ? WHERE id = ?",
+            (status, exit_time.strftime('%Y-%m-%d %H:%M:%S'), exit_price, pnl, trade_id)
+        )
+        return_amount = margin_cost + pnl
+        self.db.execute_query(
+            "UPDATE portfolios SET current_balance = current_balance + ? WHERE id = ?",
+            (return_amount, portfolio_id)
+        )
+        if self.notifier:
+            self.notifier.notify_trade_closed(trade_id, symbol, f"RECONCILED_{status}", pnl)
+
     def calculate_advanced_stats(self, portfolio_id: int) -> dict:
         """Calculates institutional metrics for a portfolio."""
         trades = self.db.fetch_all("SELECT * FROM trades WHERE portfolio_id = ? AND status LIKE 'CLOSED%'", (portfolio_id,))
