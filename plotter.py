@@ -46,12 +46,13 @@ class ChartBuilder:
             name="Price"
         ), row=1, col=1)
 
-        # 1d. Linear Regression Channel / Projection
-        if show_projection and len(df) > 20:
+        # 1d. Linear Regression / Polynomial Projection (Degree 2 or 3)
+        if show_projection and len(df) > 30:
             y = df['close'].values
             x = np.arange(len(y))
-            # Fit polynomial (degree 1 for linear regression, 2 for poly)
-            poly = np.polyfit(x, y, 2)
+            # Fit polynomial degree 3 for better trend capture
+            poly_deg = 3 
+            poly = np.polyfit(x, y, poly_deg)
             poly_func = np.poly1d(poly)
             
             # Project 10 candles
@@ -60,12 +61,20 @@ class ChartBuilder:
             
             # Use last timestamp to generate future timestamps
             last_ts = df['timestamp'].iloc[-1]
-            freq = pd.infer_freq(df['timestamp']) or '5min'
+            freq = pd.infer_freq(df['timestamp'])
+            if not freq:
+                # Estimate frequency if infer_freq fails
+                if len(df) > 1:
+                    diff = df['timestamp'].iloc[-1] - df['timestamp'].iloc[-2]
+                    freq = diff
+                else:
+                    freq = '5min'
+            
             future_ts = pd.date_range(start=last_ts, periods=11, freq=freq)[1:]
             
             fig.add_trace(go.Scatter(
                 x=future_ts, y=future_y, 
-                name="Poly Projection (deg 2)", 
+                name=f"Poly Projection (deg {poly_deg})", 
                 line=dict(color='cyan', dash='dash', width=2)
             ), row=1, col=1)
 

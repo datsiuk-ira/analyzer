@@ -77,6 +77,31 @@ class MarketScreener:
                 score = float(signal.debug_info.get('Score', 0)) if signal.debug_info else 0.0
                 
                 # Status: if Score >= 3 -> "SIGNAL", if Score >= 2 -> "NEAR MISS", else "WAIT"
+                # Logic: In database.py, we have signal_history. 
+                # If a signal for a coin appeared multiple times or on multiple timeframes, boost score.
+                # Since screener.py doesn't have direct access to DatabaseManager instance usually (it's passed in or created),
+                # we'll assume we can use a local one or passed one.
+                # Actually, in app.py, screener is created without DB. Let's add DB access to screener.
+                
+                # Boost Score based on Signal History (Confidence)
+                history_score_boost = 0.0
+                try:
+                    from database import DatabaseManager
+                    db = DatabaseManager()
+                    history = db.fetch_all(
+                        "SELECT COUNT(*) as count FROM signal_history WHERE symbol = ? AND timestamp >= datetime('now', '-1 day')", 
+                        (symbol,)
+                    )
+                    count = history.iloc[0]['count'] if not history.empty else 0
+                    if count > 5: history_score_boost = 0.5
+                    elif count > 2: history_score_boost = 0.2
+                    db.close()
+                except:
+                    pass
+
+                score = float(signal.debug_info.get('Score', 0)) if signal.debug_info else 0.0
+                score += history_score_boost
+                
                 if score >= 3.0:
                     status = "🟢 SIGNAL"
                 elif score >= 2.0:

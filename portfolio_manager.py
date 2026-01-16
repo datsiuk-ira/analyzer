@@ -401,22 +401,41 @@ class PortfolioManager:
             self.notifier.notify_trade_closed(trade_id, symbol, f"RECONCILED_{status}", pnl)
 
     def get_portfolio_metrics(self, portfolio_id: int) -> dict:
-        """Returns metrics like Free Capital and Funds in Use."""
+        """Returns comprehensive metrics including Equity, Win Rate, and Drawdown."""
+        # Ensure portfolio_id is an integer
+        try:
+            portfolio_id = int(portfolio_id)
+        except (ValueError, TypeError):
+            logger.error(f"Invalid portfolio_id type in get_portfolio_metrics: {type(portfolio_id)}")
+            return {}
+
         portfolio = self.db.fetch_all("SELECT * FROM portfolios WHERE id = ?", (portfolio_id,))
-        if portfolio.empty: return {}
+        if portfolio.empty:
+            logger.warning(f"Portfolio {portfolio_id} not found in get_portfolio_metrics.")
+            return {}
         
         balance = portfolio.iloc[0]['current_balance']
         
-        # Calculate Funds in Use (Locked Margin)
+        # 1. Calculate Funds in Use (Locked Margin)
         trades = self.db.fetch_all("SELECT position_size_usdt, leverage FROM trades WHERE portfolio_id = ? AND status IN ('OPEN', 'PARTIAL')", (portfolio_id,))
         funds_in_use = 0
+        
         if not trades.empty:
+            # Handle potential None/NaN in leverage or position_size
+            trades['leverage'] = trades['leverage'].fillna(self.LEVERAGE).replace(0, self.LEVERAGE)
             funds_in_use = (trades['position_size_usdt'] / trades['leverage']).sum()
             
+        # 2. Get Advanced Stats (Win Rate, PF, DD)
+        stats = self.calculate_advanced_stats(portfolio_id)
+            
         return {
-            "balance": balance,
-            "funds_in_use": round(funds_in_use, 2),
-            "free_capital": round(balance, 2) # In this system, balance already has margin deducted
+            "balance": round(float(balance), 2),
+            "funds_in_use": round(float(funds_in_use), 2),
+            "free_capital": round(float(balance), 2), # In this system, balance has margin already deducted
+            "total_equity": round(float(balance + funds_in_use), 2), # Simplified equity
+            "win_rate": stats.get("WinRate", 0),
+            "profit_factor": stats.get("PF", 0),
+            "max_drawdown": stats.get("DD", 0)
         }
 
     def calculate_advanced_stats(self, portfolio_id: int) -> dict:
