@@ -60,12 +60,13 @@ class MarketScreener:
                 strategy = strategy_class(df, None, strat_settings)
                 signal = strategy.generate_signal()
                 
-                last_row = df.iloc[-1]
+                last_row = df.iloc[-2] # Analysis based on last closed candle
+                current_row = df.iloc[-1] # For live price
                 ema_trend = last_row.get('EMA_TREND')
                 if pd.isna(ema_trend):
                     trend = "Neutral (No EMA200)"
                 else:
-                    trend = "Bullish" if last_row['close'] > ema_trend else "Bearish"
+                    trend = "Bullish" if current_row['close'] > ema_trend else "Bearish"
                 
                 adx = last_row.get('ADX', 0)
                 if pd.isna(adx): adx = 0
@@ -115,7 +116,7 @@ class MarketScreener:
 
                 # Collect extra data for Quick Sim
                 # We'll need last_price, SL, TP, strength, breakdown, efficiency_ratio
-                last_price = float(last_row['close'])
+                last_price = float(current_row['close'])
                 # Quick ATR-based SL/TP for screener results
                 atr_val = last_row.get('ATR')
                 if pd.isna(atr_val) or atr_val == 0:

@@ -48,7 +48,7 @@ class BinanceFetcher(DataFetcher):
             if len(ohlcv[0]) >= 11:
                 df['taker_buy_vol'] = [x[10] for x in ohlcv]
             else:
-                df['taker_buy_vol'] = df['volume'] * 0.5 # Fallback
+                df['taker_buy_vol'] = None # Explicitly set to None if not available
                 
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             

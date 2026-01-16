@@ -26,8 +26,8 @@ class PortfolioManager:
             logger.info("SYSTEM: Initializing default portfolios...")
             default_data = [
                 ("Conservative", 10000.0, 10000.0, 0.01),
-                ("Moderate", 10000.0, 10000.0, 0.05),
-                ("Aggressive", 10000.0, 10000.0, 0.15)
+                ("Moderate", 10000.0, 10000.0, 0.02),
+                ("Aggressive", 10000.0, 10000.0, 0.05)
             ]
             for profile in default_data:
                 self.db.execute_query(
@@ -38,7 +38,7 @@ class PortfolioManager:
     def get_portfolios(self) -> pd.DataFrame:
         return self.db.fetch_all("SELECT * FROM portfolios")
 
-    def open_position(self, portfolio_id: int, symbol: str, direction: str, entry_price: float, sl: float, tp: float, notes: str = "", risk_multiplier: float = 1.0, score_breakdown: dict = None, efficiency_ratio: float = 1.0):
+    def open_position(self, portfolio_id: int, symbol: str, direction: str, entry_price: float, sl: float, tp: float, notes: str = "", risk_multiplier: float = 1.0, score_breakdown: dict = None, efficiency_ratio: float = 1.0, daily_atr: float = None):
         """Calculates size and opens a position for a specific portfolio."""
         # Ensure portfolio_id is an integer (sometimes passed as string from UI)
         try:
@@ -55,10 +55,31 @@ class PortfolioManager:
         balance = portfolio.iloc[0]['current_balance']
         risk_pct = portfolio.iloc[0]['risk_per_trade']
         
+        # Correlation Filter Logic
+        # 1. Fetch current open positions for this portfolio
+        current_trades = self.db.fetch_all("SELECT symbol FROM trades WHERE portfolio_id = ? AND status IN ('OPEN', 'PARTIAL')", (portfolio_id,))
+        if not current_trades.empty:
+            from correlation import MarketRegime
+            regime = MarketRegime() # Or pass the global instance
+            import asyncio
+            try:
+                # We need to run the async check_portfolio_correlation in a sync method
+                # This might be tricky if already inside an event loop.
+                # In bot_scanner (async) we can await it. In app.py (sync) we use run_async.
+                # Let's assume for now we use a simpler approach or the caller handles it.
+                # For this task, I'll add the check and try to run it.
+                loop = asyncio.get_event_loop()
+                max_corr = loop.run_until_complete(regime.check_portfolio_correlation(symbol, current_trades['symbol'].tolist()))
+                if max_corr > 0.8:
+                    logger.warning(f"Correlation Filter: {symbol} has {max_corr:.2f} correlation with existing positions. Reducing risk by 50%.")
+                    risk_multiplier *= 0.5
+            except Exception as e:
+                logger.error(f"Correlation check failed: {e}")
+
         # We reuse RiskCalculator logic but with portfolio's balance and risk_pct
         risk_calc = RiskCalculator(balance, risk_pct * 100) # RiskCalculator expects % not decimal
-        # Apply risk multiplier and efficiency ratio
-        pos_value, quantity = risk_calc.calculate_position_size(entry_price, sl, strength=risk_multiplier, efficiency_ratio=efficiency_ratio)
+        # Apply risk multiplier and efficiency ratio, plus daily_atr for vol targeting
+        pos_value, quantity = risk_calc.calculate_position_size(entry_price, sl, strength=risk_multiplier, efficiency_ratio=efficiency_ratio, daily_atr=daily_atr)
 
         if quantity <= 0:
             logger.warning(f"Invalid quantity calculated for {symbol} in portfolio {portfolio_id}")
@@ -121,10 +142,23 @@ class PortfolioManager:
             else:
                 unrealized_pnl = (entry - current_price) * qty
             
-            # We don't have a column for unrealized PnL in 'trades', but we can log it or 
-            # we could update a dedicated 'pnl' column if we decide to use it for current state too.
-            # For now, let's just make sure we have a way to calculate metrics.
+            # MAE/MFE Tracking
+            max_drawdown_price = trade.get('max_drawdown_price')
+            max_profit_price = trade.get('max_profit_price')
+
+            if direction == 'BUY':
+                new_max_profit = max(high, max_profit_price) if max_profit_price is not None else high
+                new_max_drawdown = min(low, max_drawdown_price) if max_drawdown_price is not None else low
+            else: # SELL
+                new_max_profit = min(low, max_profit_price) if max_profit_price is not None else low
+                new_max_drawdown = max(high, max_drawdown_price) if max_drawdown_price is not None else high
             
+            if new_max_profit != max_profit_price or new_max_drawdown != max_drawdown_price:
+                self.db.execute_query(
+                    "UPDATE trades SET max_profit_price = ?, max_drawdown_price = ? WHERE id = ?",
+                    (new_max_profit, new_max_drawdown, trade_id)
+                )
+
             # 1. Check SL/TP
             hit_sl = False
             hit_tp = False

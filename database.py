@@ -5,6 +5,31 @@ import json
 from logger import logger
 import os
 
+import time
+import random
+import functools
+
+def retry_db_transaction(max_retries=5, initial_delay=0.05, max_delay=0.2):
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exception = None
+            for i in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except sqlite3.OperationalError as e:
+                    if "database is locked" in str(e).lower():
+                        last_exception = e
+                        delay = random.uniform(initial_delay, max_delay)
+                        logger.warning(f"Database locked, retrying {i+1}/{max_retries} after {delay:.3f}s...")
+                        time.sleep(delay)
+                    else:
+                        raise e
+            logger.error(f"Max retries reached for database transaction. Last error: {last_exception}")
+            raise last_exception
+        return wrapper
+    return decorator
+
 class DatabaseManager:
     """
     Handles SQLite database connections and schema for paper trading.
@@ -60,6 +85,8 @@ class DatabaseManager:
                 notes TEXT,
                 score_breakdown TEXT,
                 leverage REAL DEFAULT 1.0,
+                max_drawdown_price REAL,
+                max_profit_price REAL,
                 FOREIGN KEY (portfolio_id) REFERENCES portfolios(id)
             )
         ''')
@@ -92,11 +119,13 @@ class DatabaseManager:
         conn.commit()
         logger.info("Database initialized successfully.")
 
+    @retry_db_transaction()
     def execute_query(self, query: str, params: tuple = ()):
         conn = self._get_connection()
         try:
             # Enable WAL mode for better concurrency
             conn.execute("PRAGMA journal_mode=WAL")
+            # Set shorter busy timeout if needed, but retry_db_transaction handles it too
             cursor = conn.cursor()
             cursor.execute(query, params)
             conn.commit()

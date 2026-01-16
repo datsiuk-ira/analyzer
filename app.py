@@ -19,6 +19,7 @@ from views.dashboard import render_dashboard
 from views.coin_details import render_coin_view
 from views.portfolio import render_portfolio_view
 from views.validator import render_signal_validator
+from views.backtest import render_backtest_view
 
 def run_async(coro):
     return asyncio.run(coro)
@@ -109,7 +110,7 @@ def main():
     st.title(f"🚀 {settings.page_title}")
 
     # Top Navigation
-    tabs = ["🚀 Dashboard", "📈 Coin View", "💼 Portfolios", "✅ Signal Validator"]
+    tabs = ["🚀 Dashboard", "📈 Coin View", "💼 Portfolios", "✅ Signal Validator", "🧪 Backtest"]
     page = st.pills("Navigation", tabs, default=st.session_state.nav_page, key="nav_pills", label_visibility="collapsed")
     
     if page and page != st.session_state.nav_page:
@@ -221,6 +222,8 @@ def main():
         render_portfolio_view(st.session_state.pm)
     elif page == "✅ Signal Validator":
         render_signal_validator(st.session_state.symbol)
+    elif page == "🧪 Backtest":
+        render_backtest_view(st.session_state.symbol)
 
 if __name__ == "__main__":
     main()

@@ -42,11 +42,12 @@ class ScalpingStrategy(BaseStrategy):
     Logic optimized for 1m-15m.
     Includes MTF filter, ADX filter, and Weighted Score-based confluence.
     """
-    def generate_signal(self) -> Signal:
-        if self.df.empty or len(self.df) < 10:
+    def generate_signal(self, index: int = -2) -> Signal:
+        if self.df.empty or len(self.df) < abs(index) + 1:
             return Signal(SignalType.NEUTRAL, "Insufficient data", "Scalping")
 
-        last_row = self.df.iloc[-1]
+        last_row = self.df.iloc[index]
+        current_row = self.df.iloc[-1]
         
         rsi_overbought = self.settings.get('rsi_overbought', 70)
         rsi_oversold = self.settings.get('rsi_oversold', 30)
@@ -54,8 +55,16 @@ class ScalpingStrategy(BaseStrategy):
 
         # 1. ADX Filter (Market Strength)
         adx_value = last_row.get('ADX', 0)
-        if adx_value < adx_threshold:
-            return Signal(SignalType.NEUTRAL, f"ADX too low ({adx_value:.2f} < {adx_threshold}) - Choppy market", "Scalping", {"ADX": f"{adx_value:.2f}"})
+        er = last_row.get('efficiency_ratio', 1.0)
+        
+        # Kaufman Efficiency Ratio Check (Noise Filter)
+        if er < 0.35:
+            debug_info = {"ADX": f"{adx_value:.2f}", "ER": f"{er:.2f}", "Score": "0.0"}
+            return Signal(SignalType.NEUTRAL, f"Signal Filtered: Market too Choppy (ER {er:.2f} < 0.35)", "Scalping", debug_info)
+
+        if adx_value < 20: # Hard requirement ADX > 20
+            debug_info = {"ADX": f"{adx_value:.2f}", "ER": f"{er:.2f}", "Score": "0.0"}
+            return Signal(SignalType.NEUTRAL, f"ADX too low ({adx_value:.2f} < 20) - Choppy market", "Scalping", debug_info)
 
         # 2. MTF Filter (Higher Timeframe Trend)
         htf_info = "N/A"
@@ -91,8 +100,8 @@ class ScalpingStrategy(BaseStrategy):
         # 1. Trend Alignment
         ema_trend = last_row.get('EMA_TREND')
         if not pd.isna(ema_trend) and ema_trend != 0:
-            if last_row['close'] > ema_trend: long_score_map['Trend'] = 1.5
-            if last_row['close'] < ema_trend: short_score_map['Trend'] = 1.5
+            if current_row['close'] > ema_trend: long_score_map['Trend'] = 1.5
+            if current_row['close'] < ema_trend: short_score_map['Trend'] = 1.5
         
         # 2. MTF Filter (Higher Timeframe Trend Alignment - Higher Weight)
         if htf_info == "Bullish": long_score_map['MTF_Trend'] = 2.0
@@ -123,16 +132,21 @@ class ScalpingStrategy(BaseStrategy):
             short_score_map['Volume'] = vol_points
         
         # 7. Order Flow (CVD Delta)
-        delta_increasing = False
-        if 'delta' in self.df.columns:
-            recent_delta = self.df['delta'].tail(3)
-            if len(recent_delta) == 3:
+        delta_points = 0.0
+        if 'delta' in self.df.columns and not pd.isna(last_row.get('delta')):
+            recent_delta = self.df['delta'].iloc[:-1].tail(3) # Use closed candles for trend
+            delta_increasing = False
+            if len(recent_delta) >= 2:
                 delta_increasing = recent_delta.iloc[-1] > recent_delta.iloc[-2]
+            
+            if delta_increasing and last_row.get('delta', 0) > 0:
+                delta_points = 0.5
+            if not delta_increasing and last_row.get('delta', 0) < 0:
+                delta_points = 0.5
         
-        if delta_increasing and last_row.get('delta', 0) > 0:
-            long_score_map['Delta'] = 0.5
-        if not delta_increasing and last_row.get('delta', 0) < 0:
-            short_score_map['Delta'] = 0.5
+        if delta_points > 0:
+            long_score_map['Delta'] = delta_points
+            short_score_map['Delta'] = delta_points
 
         # 8. Sentiment (Contrarian)
         if self.sentiment:
@@ -209,11 +223,12 @@ class SwingStrategy(BaseStrategy):
     Logic optimized for 1h-4h.
     Focuses on trend confirmation and Score-based RSI Divergence.
     """
-    def generate_signal(self) -> Signal:
-        if self.df.empty or len(self.df) < 10:
+    def generate_signal(self, index: int = -2) -> Signal:
+        if self.df.empty or len(self.df) < abs(index) + 1:
             return Signal(SignalType.NEUTRAL, "Insufficient data", "Swing")
 
-        last_row = self.df.iloc[-1]
+        last_row = self.df.iloc[index]
+        current_row = self.df.iloc[-1]
         
         rsi_overbought = self.settings.get('rsi_overbought', 70)
         rsi_oversold = self.settings.get('rsi_oversold', 30)
@@ -229,13 +244,23 @@ class SwingStrategy(BaseStrategy):
             else:
                 htf_info = "Neutral (No HTF EMA)"
 
+        # Choppiness Filter
+        er = last_row.get('efficiency_ratio', 1.0)
+        if er < 0.35:
+            return Signal(SignalType.NEUTRAL, f"Signal Filtered: Market too Choppy (ER {er:.2f} < 0.35)", "Swing")
+
+        # ADX Filter
+        adx_value = last_row.get('ADX', 0)
+        if adx_value < 20:
+            return Signal(SignalType.NEUTRAL, f"ADX too low ({adx_value:.2f} < 20)", "Swing")
+
         # 2. Local Trend
         ema_trend = last_row.get('EMA_TREND')
         is_bullish = False
         is_bearish = False
         if not pd.isna(ema_trend) and ema_trend != 0:
-            is_bullish = last_row['close'] > ema_trend
-            is_bearish = last_row['close'] < ema_trend
+            is_bullish = current_row['close'] > ema_trend
+            is_bearish = current_row['close'] < ema_trend
 
         # 3. RSI and Divergence
         recent_df = self.df.tail(4)
@@ -262,16 +287,21 @@ class SwingStrategy(BaseStrategy):
         if last_row.get('bearish_sfp'): short_score_map['SFP'] = 2.5
         
         # 4. Order Flow (CVD Delta)
-        delta_increasing = False
-        if 'delta' in self.df.columns:
-            recent_delta = self.df['delta'].tail(3)
-            if len(recent_delta) == 3:
+        delta_points = 0.0
+        if 'delta' in self.df.columns and not pd.isna(last_row.get('delta')):
+            recent_delta = self.df['delta'].iloc[:-1].tail(3)
+            delta_increasing = False
+            if len(recent_delta) >= 2:
                 delta_increasing = recent_delta.iloc[-1] > recent_delta.iloc[-2]
+            
+            if delta_increasing and last_row.get('delta', 0) > 0:
+                delta_points = 0.5
+            if not delta_increasing and last_row.get('delta', 0) < 0:
+                delta_points = 0.5
         
-        if delta_increasing and last_row.get('delta', 0) > 0:
-            long_score_map['Delta'] = 0.5
-        if not delta_increasing and last_row.get('delta', 0) < 0:
-            short_score_map['Delta'] = 0.5
+        if delta_points > 0:
+            long_score_map['Delta'] = delta_points
+            short_score_map['Delta'] = delta_points
 
         # 5. Sentiment
         if self.sentiment:

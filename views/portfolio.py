@@ -64,7 +64,18 @@ def render_portfolio_view(pm):
                     ORDER BY exit_time DESC LIMIT 10
                 """, (int(p_id),))
                 if not history.empty:
-                    st.dataframe(history[['id', 'symbol', 'direction', 'pnl', 'status', 'exit_time']], use_container_width=True)
+                    # Calculate MAE/MFE %
+                    history['MFE %'] = history.apply(
+                        lambda r: abs(r['max_profit_price'] - r['entry_price']) / r['entry_price'] * 100 
+                        if pd.notnull(r['max_profit_price']) and r['entry_price'] > 0 else 0, axis=1
+                    )
+                    history['MAE %'] = history.apply(
+                        lambda r: abs(r['max_drawdown_price'] - r['entry_price']) / r['entry_price'] * 100 
+                        if pd.notnull(r['max_drawdown_price']) and r['entry_price'] > 0 else 0, axis=1
+                    )
+                    
+                    cols_to_show = ['id', 'symbol', 'direction', 'pnl', 'status', 'MFE %', 'MAE %', 'exit_time']
+                    st.dataframe(history[[c for c in cols_to_show if c in history.columns]].round(2), use_container_width=True)
                 else:
                     st.write("No history.")
             

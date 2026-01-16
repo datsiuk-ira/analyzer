@@ -21,7 +21,7 @@ class BotScanner:
         self.pm = PortfolioManager(self.db, notifier=self.notifier)
         self.fetcher = BinanceFetcher()
         self.timeframes = ["1m", "3m", "5m", "15m"]
-        self.min_score = 4.5
+        self.min_score = 5.5
         # Cache to prevent double alerts for the same candle
         self.alert_cache: Set[str] = set()
         # In-memory signal cache for interactive buttons
@@ -69,7 +69,8 @@ class BotScanner:
                     sl=signal_data['sl'],
                     tp=signal_data['tp'],
                     notes=f"Interactive Telegram Trade ({profile_type})",
-                    score_breakdown=signal_data['breakdown']
+                    score_breakdown=signal_data['breakdown'],
+                    daily_atr=signal_data.get('daily_atr')
                 )
 
                 if success:
@@ -153,6 +154,15 @@ class BotScanner:
                     if results.empty:
                         continue
                     
+                    # Fetch daily data for BTC or market to get Daily ATR for Vol Targeting
+                    market_data = await self.fetcher.fetch_ohlcv("BTC/USDT", timeframe='1d', limit=14)
+                    daily_atr = None
+                    if not market_data.empty:
+                        from analyzer import MarketAnalyzer
+                        ma_daily = MarketAnalyzer(market_data)
+                        df_daily = ma_daily.calculate_indicators(atr_period=14)
+                        daily_atr = df_daily['ATR'].iloc[-1]
+
                     # Log signals to DB for Confidence Scoring
                     for _, row in results.iterrows():
                         if row['Score'] >= 2.0: # Log interesting ones
@@ -181,7 +191,8 @@ class BotScanner:
                                 'price': row['Price'],
                                 'sl': row['SL'],
                                 'tp': row['TP'],
-                                'breakdown': row['Breakdown']
+                                'breakdown': row['Breakdown'],
+                                'daily_atr': daily_atr
                             }
 
                             # Send interactive message

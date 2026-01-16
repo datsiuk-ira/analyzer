@@ -72,3 +72,43 @@ class MarketRegime:
     def get_risk_multiplier(self) -> float:
         """Reduce position sizes by 50% automatically if risk_off."""
         return 0.5 if self.risk_off else 1.0
+
+    async def check_portfolio_correlation(self, new_symbol: str, current_positions: list) -> float:
+        """
+        Calculates correlation between a new asset and existing positions.
+        Returns the maximum correlation found.
+        """
+        if not current_positions:
+            return 0.0
+        
+        fetcher = BinanceFetcher()
+        try:
+            # Fetch last 24h data for new symbol (1h timeframe)
+            new_df = await fetcher.fetch_ohlcv(new_symbol, "1h", limit=24)
+            if new_df.empty or len(new_df) < 12:
+                return 0.0
+            
+            new_returns = new_df['close'].pct_change().dropna()
+            
+            max_corr = 0.0
+            for pos_symbol in current_positions:
+                if pos_symbol == new_symbol:
+                    continue
+                
+                pos_df = await fetcher.fetch_ohlcv(pos_symbol, "1h", limit=24)
+                if pos_df.empty or len(pos_df) < 12:
+                    continue
+                
+                pos_returns = pos_df['close'].pct_change().dropna()
+                
+                # Align returns by timestamp if possible, or just compare if lengths match
+                # For simplicity, we assume they align mostly
+                min_len = min(len(new_returns), len(pos_returns))
+                if min_len < 10: continue
+                
+                correlation = new_returns.tail(min_len).corr(pos_returns.tail(min_len))
+                max_corr = max(max_corr, correlation)
+                
+            return max_corr
+        finally:
+            await fetcher.close()

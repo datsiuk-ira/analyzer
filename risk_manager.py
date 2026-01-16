@@ -6,10 +6,11 @@ class RiskCalculator:
     """
     Class responsible for risk management and position sizing.
     """
-    def __init__(self, balance: float, risk_per_trade: float, rr_ratio: float = 2.0):
+    def __init__(self, balance: float, risk_per_trade: float, rr_ratio: float = 2.0, target_daily_vol: float = 0.02):
         self.balance = balance
         self.base_risk_pct = risk_per_trade / 100  # Convert percentage to decimal
         self.rr_ratio = rr_ratio
+        self.target_daily_vol = target_daily_vol # Institutional Vol Targeting (e.g., 2%)
 
     def calculate_levels(self, current_price: float, atr: float, signal_type: str, 
                          atr_multiplier: float = 2.0, entry_type: str = None) -> Tuple[float, float]:
@@ -36,11 +37,12 @@ class RiskCalculator:
             
         return round(stop_loss, 6), round(take_profit, 6)
 
-    def calculate_position_size(self, entry_price: float, stop_loss: float, strength: float = 1.0, efficiency_ratio: float = 1.0) -> Tuple[float, float]:
+    def calculate_position_size(self, entry_price: float, stop_loss: float, strength: float = 1.0, efficiency_ratio: float = 1.0, daily_atr: float = None) -> Tuple[float, float]:
         """
         Calculates the position size in USDT and Token quantity.
         Includes Kelly Criterion Lite (adjusts risk based on signal strength).
         Applies Half-Kelly and Efficiency Ratio (Noise) filters.
+        NEW: Includes Dynamic Volatility Targeting cap and Volatility Scaling.
         """
         if entry_price == stop_loss or entry_price <= 0:
             return 0.0, 0.0
@@ -51,7 +53,15 @@ class RiskCalculator:
         HALF_KELLY_MULT = 0.5
         adjusted_risk_pct = self.base_risk_pct * strength * HALF_KELLY_MULT
 
-        # 2. Efficiency Ratio (ER) Filter: Reduce size in choppy markets
+        # 2. Volatility Scaling: Reduce risk if ATR is high relative to price
+        # If ATR > 2% of price, reduce risk proportionally
+        volatility = daily_atr / entry_price if daily_atr else 0.02 # default to 2%
+        if volatility > 0.02:
+            reduction_factor = 0.02 / volatility
+            adjusted_risk_pct *= reduction_factor
+            logger.debug(f"Volatility Scaling: High Volatility {volatility:.2%}. Reducing risk by factor {reduction_factor:.2f}")
+
+        # 3. Efficiency Ratio (ER) Filter: Reduce size in choppy markets
         # If ER < 0.3, reduce size by 50%
         if efficiency_ratio < 0.3:
             adjusted_risk_pct *= 0.5
@@ -67,7 +77,16 @@ class RiskCalculator:
         quantity = risk_usdt / price_risk
         position_value = quantity * entry_price
         
-        logger.debug(f"Position Size: Risk USDT={risk_usdt:.2f}, Strength={strength}, ER={efficiency_ratio:.2f}, Qty={quantity:.6f}")
+        # 4. Institutional Volatility Targeting Cap
+        # Formula: Max_Position_Value = (Balance * Target_Daily_Vol) / (Daily_ATR / Price)
+        if daily_atr and daily_atr > 0:
+            vol_target_size = (self.balance * self.target_daily_vol) / (daily_atr / entry_price)
+            if position_value > vol_target_size:
+                logger.debug(f"Vol Target Cap: Reducing size from {position_value:.2f} to {vol_target_size:.2f}")
+                position_value = vol_target_size
+                quantity = position_value / entry_price
+        
+        logger.debug(f"Position Size: Risk USDT={risk_usdt:.2f}, Strength={strength}, ER={efficiency_ratio:.2f}, Qty={quantity:.6f}, Val={position_value:.2f}")
         return round(position_value, 2), round(quantity, 6)
 
     @staticmethod
