@@ -19,7 +19,7 @@ class MarketRegime:
         """
         fetcher = BinanceFetcher()
         try:
-            df = await fetcher.fetch_ohlcv("BTC/USDT", timeframe, limit=300)
+            df = await fetcher.fetch_ohlcv("BTC/USDT", timeframe, limit=1000)
             if df.empty:
                 logger.warning("Failed to fetch BTC data for correlation check.")
                 return

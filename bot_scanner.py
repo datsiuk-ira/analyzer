@@ -2,30 +2,36 @@ import time
 import asyncio
 import uuid
 from typing import Set, Dict
-from data_loader import BinanceFetcher
+from data_loader import BinanceFetcher, RealTimeDataStreamer, CoinglassConnector
 from screener import MarketScreener
 from notifications import NotificationManager
 from config import settings
 from logger import logger
 from database import DatabaseManager
 from portfolio_manager import PortfolioManager
+from analyzer import MarketAnalyzer
+from strategy import ScalpingStrategy, SignalType
 
 class BotScanner:
     """
     Standalone background scanner for 24/7 trading signals with Interactive Trading.
+    Upgraded to Low-Latency Real-Time Streaming and Institutional Metrics.
     """
-    def __init__(self, interval: int = 60):
+    def __init__(self, db: DatabaseManager, interval: int = 60):
         self.interval = interval
-        self.db = DatabaseManager()
+        self.db = db
         self.notifier = NotificationManager()
         self.pm = PortfolioManager(self.db, notifier=self.notifier)
         self.fetcher = BinanceFetcher()
+        self.coinglass = CoinglassConnector()
+        self.streamer = None
         self.timeframes = ["1m", "3m", "5m", "15m"]
-        self.min_score = 5.5
+        self.min_score = 6.5
         # Cache to prevent double alerts for the same candle
         self.alert_cache: Set[str] = set()
         # In-memory signal cache for interactive buttons
         self.signal_cache: Dict[str, dict] = {}
+        self.symbols = settings.symbols
 
     def setup_callbacks(self):
         """Sets up Telegram callback handlers."""
@@ -60,6 +66,12 @@ class BotScanner:
 
                 p_id = int(target_p.iloc[0]['id'])
                 
+                # Liquidity-based TP override
+                tp = signal_data['tp']
+                if signal_data.get('liq_tp'):
+                    tp = signal_data['liq_tp']
+                    logger.info(f"Using Liquidity-based TP: {tp} for {signal_data['symbol']}")
+
                 # Open trade
                 success = self.pm.open_position(
                     portfolio_id=p_id,
@@ -67,8 +79,8 @@ class BotScanner:
                     direction=signal_data['direction'],
                     entry_price=signal_data['price'],
                     sl=signal_data['sl'],
-                    tp=signal_data['tp'],
-                    notes=f"Interactive Telegram Trade ({profile_type})",
+                    tp=tp,
+                    notes=f"Interactive Telegram Trade ({profile_type}) - Institutional Engine",
                     score_breakdown=signal_data['breakdown'],
                     daily_atr=signal_data.get('daily_atr')
                 )
@@ -78,7 +90,7 @@ class BotScanner:
                     self.notifier.bot.edit_message_text(
                         chat_id=call.message.chat.id,
                         message_id=call.message.message_id,
-                        text=call.message.text + f"\n\n✅ *Executed on {portfolio_name} profile*",
+                        text=call.message.text + f"\n\n✅ *Executed on {portfolio_name} profile*\nTP set at liquidity zone: `{tp}`",
                         parse_mode="Markdown"
                     )
                     self.notifier.bot.answer_callback_query(call.id, f"✅ Trade executed on {portfolio_name}")
@@ -89,135 +101,163 @@ class BotScanner:
                 logger.error(f"Error handling callback: {e}")
                 self.notifier.bot.answer_callback_query(call.id, "⚠️ System Error")
 
+    async def _process_stream(self):
+        """Processes real-time updates from WebSocket queue."""
+        logger.info("Real-Time Stream Processing started.")
+        while True:
+            try:
+                update = await self.streamer.queue.get()
+                if update['type'] == 'trade':
+                    # Fast SL/TP check for open positions
+                    self.pm.update_positions(
+                        update['symbol'], 
+                        update['price'], 
+                        update['price'], # Using current price as high/low for fast WS update
+                        update['price']
+                    )
+                elif update['type'] == 'orderbook':
+                    # Could be used for imbalance analysis
+                    pass
+            except Exception as e:
+                logger.error(f"Error processing stream update: {e}")
+                await asyncio.sleep(1)
+
     async def run(self):
-        logger.info(f"BOT SCANNER started. Interval: {self.interval}s, Min Score: {self.min_score}")
+        logger.info(f"INSTITUTIONAL BOT SCANNER started. Min Score: {self.min_score}")
         
-        # Periodic PnL and Position update (every 10 min)
+        # 1. Start WebSocket Streamer
+        self.symbols = await self.fetcher.fetch_top_volume_pairs(limit=20) # Focus on top 20 for real-time
+        self.streamer = RealTimeDataStreamer(self.symbols)
+        
+        # Proper task management
+        stream_task = asyncio.create_task(self.streamer.start())
+        process_task = asyncio.create_task(self._process_stream())
+
+        # 2. Periodic PnL and Position update (every 10 min) - Backup to WS
         async def pnl_update_loop():
             while True:
                 try:
                     logger.info("SCANNER: Running periodic position/PnL update...")
-                    # Fetch all open trades
                     open_trades = self.db.fetch_all("SELECT DISTINCT symbol FROM trades WHERE status IN ('OPEN', 'PARTIAL')")
                     if not open_trades.empty:
                         for symbol in open_trades['symbol']:
-                            # Fetch current price
                             df = await self.fetcher.fetch_ohlcv(symbol, timeframe='1m', limit=1)
                             if not df.empty:
                                 last_row = df.iloc[-1]
-                                # Trigger pm.update_positions which now also updates PnL in thought (though we didn't add a column, it ensures SL/TP hits are processed)
-                                # and we could add actual unrealized PnL logging here if we had a column.
                                 self.pm.update_positions(symbol, last_row['close'], last_row['high'], last_row['low'])
-                    
-                    await asyncio.sleep(600) # 10 minutes
+                    await asyncio.sleep(600)
                 except Exception as e:
                     logger.error(f"Error in PnL update loop: {e}")
                     await asyncio.sleep(60)
 
         asyncio.create_task(pnl_update_loop())
 
-        # Start Telegram polling in a separate thread/task
+        # 3. Start Telegram polling
         self.setup_callbacks()
         if self.notifier.bot:
-            logger.info("Telegram Bot Polling started.")
-            # We use a non-blocking way to poll if possible, or run it in a loop
-            # For simplicity in this standalone script, we can run it in a background thread
             import threading
             def poll():
                 while True:
-                    try:
-                        self.notifier.bot.infinity_polling()
+                    try: self.notifier.bot.infinity_polling()
                     except Exception as e:
                         logger.error(f"Telegram Polling Error: {e}")
                         time.sleep(10)
-            
             threading.Thread(target=poll, daemon=True).start()
 
+        # 4. Main Scanning Loop (Enriched with Institutional Data)
         while True:
             try:
                 start_time = time.time()
                 
-                for tf in self.timeframes:
-                    logger.info(f"Scanning market for timeframe: {tf}...")
-                    screener = MarketScreener(timeframe=tf)
-                    
-                    strat_settings = {
-                        'ema_short': settings.ema_short,
-                        'ema_long': settings.ema_long,
-                        'ema_trend': settings.ema_trend,
-                        'rsi_period': settings.rsi_period,
-                        'adx_period': settings.adx_period
-                    }
-                    
-                    results = await screener.scan_market(strat_settings, top_limit=50, fetcher=self.fetcher)
-                    
-                    if results.empty:
-                        continue
-                    
-                    # Fetch daily data for BTC or market to get Daily ATR for Vol Targeting
-                    market_data = await self.fetcher.fetch_ohlcv("BTC/USDT", timeframe='1d', limit=14)
-                    daily_atr = None
-                    if not market_data.empty:
-                        from analyzer import MarketAnalyzer
-                        ma_daily = MarketAnalyzer(market_data)
-                        df_daily = ma_daily.calculate_indicators(atr_period=14)
-                        daily_atr = df_daily['ATR'].iloc[-1]
+                # Fetch global Daily ATR for Vol Targeting once per loop
+                market_data = await self.fetcher.fetch_ohlcv("BTC/USDT", timeframe='1d', limit=14)
+                daily_atr = None
+                if not market_data.empty:
+                    ma_daily = MarketAnalyzer(market_data)
+                    df_daily = ma_daily.calculate_indicators(atr_period=14)
+                    daily_atr = df_daily['ATR'].iloc[-1]
 
-                    # Log signals to DB for Confidence Scoring
-                    for _, row in results.iterrows():
-                        if row['Score'] >= 2.0: # Log interesting ones
+                for tf in self.timeframes:
+                    logger.info(f"Scanning {len(self.symbols)} symbols on {tf}...")
+                    
+                    # Fetch data for all symbols
+                    data_map = await self.fetcher.fetch_multiple_symbols_ohlcv(self.symbols, tf, limit=200)
+                    
+                    for symbol, df in data_map.items():
+                        if df.empty or len(df) < 50: continue
+                        
+                        # 1. Enrich with Institutional Data
+                        oi_data = await self.coinglass.fetch_open_interest(symbol)
+                        funding = await self.coinglass.fetch_funding_rate(symbol)
+                        liq_zones = await self.coinglass.fetch_liquidation_heatmap(symbol)
+                        
+                        oi_change = 0
+                        if isinstance(oi_data, list) and len(oi_data) > 1:
+                            # Calculate % change in OI
+                            oi_change = (oi_data[0].get('openInterest', 0) / oi_data[1].get('openInterest', 1)) - 1
+
+                        inst_data = {
+                            'oi_change': oi_change,
+                            'funding_rate': funding,
+                            'liquidation_zones': liq_zones
+                        }
+
+                        # 2. Analyze & Strategy
+                        analyzer = MarketAnalyzer(df)
+                        df = analyzer.calculate_indicators()
+                        df = analyzer.detect_rsi_divergence()
+                        df = analyzer.detect_patterns()
+                        
+                        strat_settings = {
+                            'ema_short': settings.ema_short,
+                            'ema_long': settings.ema_long,
+                            'ema_trend': settings.ema_trend,
+                            'rsi_period': settings.rsi_period,
+                            'adx_period': settings.adx_period
+                        }
+                        
+                        strategy = ScalpingStrategy(df, None, strat_settings, institutional_data=inst_data)
+                        signal = strategy.generate_signal()
+                        
+                        # Log to History
+                        if signal.type != SignalType.NEUTRAL:
+                            score = float(signal.debug_info.get('Score', 0))
                             self.db.execute_query(
                                 "INSERT INTO signal_history (symbol, timeframe, signal_type, score) VALUES (?, ?, ?, ?)",
-                                (row['Symbol'], tf, row['Signal'], row['Score'])
-                            )
-                        
-                    high_signals = results[results['Score'] >= self.min_score]
-                    
-                    for _, row in high_signals.iterrows():
-                        symbol = row['Symbol']
-                        score = row['Score']
-                        
-                        current_min = time.strftime("%Y-%m-%d %H:%M")
-                        alert_key = f"{symbol}_{tf}_{current_min}"
-                        
-                        if alert_key not in self.alert_cache:
-                            logger.info(f"🎯 HIGH SCORE SIGNAL: {symbol} | TF: {tf} | Score: {score}")
-                            
-                            # Generate unique ID for this signal
-                            signal_id = str(uuid.uuid4())[:8]
-                            self.signal_cache[signal_id] = {
-                                'symbol': symbol,
-                                'direction': row['Signal'],
-                                'price': row['Price'],
-                                'sl': row['SL'],
-                                'tp': row['TP'],
-                                'breakdown': row['Breakdown'],
-                                'daily_atr': daily_atr
-                            }
-
-                            # Send interactive message
-                            self.notifier.notify_signal(
-                                symbol=symbol,
-                                signal_type=f"{row['Signal']} ({tf})",
-                                score=score,
-                                breakdown=row['Breakdown'],
-                                sl=row['SL'],
-                                tp=row['TP'],
-                                signal_id=signal_id
+                                (symbol, tf, signal.type.value, score)
                             )
                             
-                            self.alert_cache.add(alert_key)
-                            
-                            # Cleanup old caches
-                            if len(self.alert_cache) > 1000: self.alert_cache.clear()
-                            if len(self.signal_cache) > 500:
-                                # Simple FIFO cleanup for signal cache
-                                first_key = next(iter(self.signal_cache))
-                                del self.signal_cache[first_key]
+                            # Alert if high score
+                            if score >= self.min_score:
+                                current_min = time.strftime("%Y-%m-%d %H:%M")
+                                alert_key = f"{symbol}_{tf}_{current_min}"
+                                
+                                if alert_key not in self.alert_cache:
+                                    signal_id = str(uuid.uuid4())[:8]
+                                    self.signal_cache[signal_id] = {
+                                        'symbol': symbol,
+                                        'direction': signal.type.value,
+                                        'price': df.iloc[-1]['close'],
+                                        'sl': df.iloc[-1]['close'] * 0.98 if signal.type == SignalType.BUY else df.iloc[-1]['close'] * 1.02, # Fallback sl
+                                        'tp': df.iloc[-1]['close'] * 1.04 if signal.type == SignalType.BUY else df.iloc[-1]['close'] * 0.96, # Fallback tp
+                                        'breakdown': signal.score_breakdown,
+                                        'daily_atr': daily_atr,
+                                        'liq_tp': signal.liq_tp
+                                    }
+                                    
+                                    self.notifier.notify_signal(
+                                        symbol=symbol,
+                                        signal_type=f"{signal.type.value} ({tf})",
+                                        score=score,
+                                        breakdown=signal.score_breakdown,
+                                        sl=self.signal_cache[signal_id]['sl'],
+                                        tp=self.signal_cache[signal_id]['tp'],
+                                        signal_id=signal_id
+                                    )
+                                    self.alert_cache.add(alert_key)
 
                 elapsed = time.time() - start_time
                 sleep_time = max(1, self.interval - elapsed)
-                logger.debug(f"Scan complete. Sleeping for {sleep_time:.2f}s")
                 await asyncio.sleep(sleep_time)
                 
             except Exception as e:
@@ -225,7 +265,9 @@ class BotScanner:
                 await asyncio.sleep(self.interval)
 
 if __name__ == "__main__":
-    scanner = BotScanner(interval=60)
+    from database import DatabaseManager
+    db = DatabaseManager()
+    scanner = BotScanner(db=db, interval=60)
     try:
         asyncio.run(scanner.run())
     except KeyboardInterrupt:

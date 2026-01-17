@@ -2,17 +2,102 @@ import telebot
 from telebot import types
 from logger import logger
 import json
+import time
+import threading
+import queue
 from typing import Optional
 from config import settings
 
 class NotificationManager:
     """
     Handles outgoing notifications (e.g., Telegram) and interactive buttons.
+    Includes a background worker and message queue to handle rate limiting.
+    Implements Singleton pattern to share the queue across modules.
     """
+    _instance = None
+    _lock = threading.Lock()
+
+    def __new__(cls, *args, **kwargs):
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = super(NotificationManager, cls).__new__(cls)
+                cls._instance._initialized = False
+            return cls._instance
+
     def __init__(self, token: Optional[str] = None, chat_id: Optional[str] = None):
+        if self._initialized:
+            return
+            
         self.token = token or settings.telegram_bot_token
         self.chat_id = chat_id or settings.telegram_chat_id
         self.bot = telebot.TeleBot(self.token) if self.token else None
+        
+        self.msg_queue = queue.Queue()
+        self.worker_thread = None
+        if self.bot:
+            self._start_worker()
+        
+        self._initialized = True
+
+    def _start_worker(self):
+        self.worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
+        self.worker_thread.start()
+
+    def _worker_loop(self):
+        while True:
+            try:
+                msg_data = self.msg_queue.get()
+                if msg_data is None: break
+                
+                message = msg_data['message']
+                reply_markup = msg_data.get('reply_markup')
+                
+                success = False
+                retries = 3
+                while not success and retries > 0:
+                    try:
+                        self.bot.send_message(
+                            chat_id=self.chat_id,
+                            text=message,
+                            parse_mode="Markdown",
+                            reply_markup=reply_markup
+                        )
+                        success = True
+                        time.sleep(0.3) # Throttle: ~3 messages per second max (Respects Telegram limits)
+                    except telebot.apihelper.ApiTelegramException as e:
+                        if e.error_code == 429:
+                            retry_after = e.result_json.get('parameters', {}).get('retry_after', 5)
+                            logger.warning(f"Telegram Rate Limited (429). Retrying after {retry_after}s...")
+                            time.sleep(retry_after)
+                            retries -= 1
+                        elif e.error_code == 400 and "can't parse entities" in e.description:
+                            logger.error(f"Telegram Markdown error: {e.description}. Sending as plain text.")
+                            # Fallback to plain text if Markdown fails
+                            try:
+                                self.bot.send_message(
+                                    chat_id=self.chat_id,
+                                    text=message,
+                                    reply_markup=reply_markup
+                                )
+                                success = True
+                            except:
+                                break
+                            break
+                        else:
+                            error_msg = str(e)
+                            if "403" in error_msg:
+                                logger.error("Telegram Error: Bot cannot chat with Bot. Please update .env with your User ID.")
+                            else:
+                                logger.error(f"Telegram worker error: {error_msg}")
+                            break
+                    except Exception as e:
+                        logger.error(f"Telegram worker error: {e}")
+                        break
+                
+                self.msg_queue.task_done()
+            except Exception as e:
+                logger.error(f"Notification worker loop error: {e}")
+                time.sleep(1)
 
     def _send_telegram(self, message: str, reply_markup: Optional[types.InlineKeyboardMarkup] = None) -> dict:
         if not self.token or not self.chat_id or not self.bot:
@@ -20,20 +105,11 @@ class NotificationManager:
             logger.debug(msg)
             return {"success": False, "message": msg}
 
-        try:
-            self.bot.send_message(
-                chat_id=self.chat_id,
-                text=message,
-                parse_mode="Markdown",
-                reply_markup=reply_markup
-            )
-            return {"success": True, "message": "Sent successfully!"}
-        except Exception as e:
-            error_msg = str(e)
-            if "403" in error_msg:
-                error_msg = "Telegram Error: Bot cannot chat with Bot. Please update .env with your User ID."
-            logger.error(f"Telegram notification failed: {error_msg}")
-            return {"success": False, "message": error_msg}
+        self.msg_queue.put({
+            'message': message,
+            'reply_markup': reply_markup
+        })
+        return {"success": True, "message": "Message queued for delivery."}
 
     def notify(self, message: str) -> dict:
         """

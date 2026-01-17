@@ -24,6 +24,7 @@ def render_coin_view(symbol, timeframe, htf, show_heikin, strategy_type, risk_pc
         htf_df = htf_analyzer.calculate_indicators(ema_trend=settings.ema_trend)
 
     # Main Analysis
+    # Use cached indicator calculation for performance
     analyzer = MarketAnalyzer(df)
     df = analyzer.calculate_indicators(
         ema_fast=settings.ema_short,
@@ -31,7 +32,8 @@ def render_coin_view(symbol, timeframe, htf, show_heikin, strategy_type, risk_pc
         ema_trend=settings.ema_trend,
         rsi_period=settings.rsi_period,
         atr_period=settings.atr_period,
-        adx_period=settings.adx_period
+        adx_period=settings.adx_period,
+        use_cache=True
     )
     df = analyzer.detect_rsi_divergence()
     df = analyzer.detect_patterns()
@@ -82,7 +84,9 @@ def render_coin_view(symbol, timeframe, htf, show_heikin, strategy_type, risk_pc
     elif signal.type == SignalType.SELL and 'chandelier_short' in df.columns:
         trailing_sl = df.iloc[-1]['chandelier_short']
         
-    st.session_state.pm.update_positions(symbol, last_price, df.iloc[-1]['high'], df.iloc[-1]['low'], trailing_sl=trailing_sl)
+    # Note: Streamer is no longer run in app.py to prevent event loop issues.
+    # Real-time position updates are handled by bot_scanner.py
+    # st.session_state.pm.update_positions(symbol, last_price, df.iloc[-1]['high'], df.iloc[-1]['low'], trailing_sl=trailing_sl)
 
     # UI Layout
     h_col1, h_col2, h_col3, h_col4 = st.columns(4)

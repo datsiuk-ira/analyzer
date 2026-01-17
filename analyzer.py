@@ -12,7 +12,49 @@ class MarketAnalyzer:
     def __init__(self, df: pd.DataFrame):
         self.df = df
 
+    @st.cache_data(show_spinner=False)
+    def calculate_indicators_cached(_df, **kwargs):
+        """
+        Static helper to cache heavy indicator calculations.
+        _df is prefixed with underscore to exclude it from hashing (optional, but good for large DFs).
+        Actually, streamlit hashes the dataframe, which is fine if it's not too huge.
+        """
+        analyzer = MarketAnalyzer(_df)
+        return analyzer._calculate_indicators_internal(**kwargs)
+
     def calculate_indicators(self, 
+                             ema_fast: int = 20, 
+                             ema_slow: int = 50, 
+                             ema_trend: int = 200, 
+                             rsi_period: int = 14, 
+                             atr_period: int = 14,
+                             adx_period: int = 14,
+                             stoch_rsi_period: int = 14,
+                             stoch_period: int = 14,
+                             stoch_k: int = 3,
+                             stoch_d: int = 3,
+                             use_cache: bool = True) -> pd.DataFrame:
+        """
+        Calculates technical indicators using pandas_ta with optional caching.
+        """
+        if use_cache:
+            # Hashable key for parameters
+            params = {
+                'ema_fast': ema_fast, 'ema_slow': ema_slow, 'ema_trend': ema_trend,
+                'rsi_period': rsi_period, 'atr_period': atr_period, 'adx_period': adx_period,
+                'stoch_rsi_period': stoch_rsi_period, 'stoch_period': stoch_period,
+                'stoch_k': stoch_k, 'stoch_d': stoch_d
+            }
+            return MarketAnalyzer.calculate_indicators_cached(self.df, **params)
+            
+        return self._calculate_indicators_internal(
+            ema_fast=ema_fast, ema_slow=ema_slow, ema_trend=ema_trend,
+            rsi_period=rsi_period, atr_period=atr_period, adx_period=adx_period,
+            stoch_rsi_period=stoch_rsi_period, stoch_period=stoch_period,
+            stoch_k=stoch_k, stoch_d=stoch_d
+        )
+
+    def _calculate_indicators_internal(self, 
                              ema_fast: int = 20, 
                              ema_slow: int = 50, 
                              ema_trend: int = 200, 
@@ -31,6 +73,16 @@ class MarketAnalyzer:
             logger.warning("Analyzer received an empty DataFrame.")
             return df
 
+        # Data Validation: Ensure enough data for indicators
+        min_required = max(ema_trend, rsi_period, atr_period, adx_period, 50)
+        if len(df) < min_required:
+            logger.warning(f"Not enough data for indicators. Required: {min_required}, Got: {len(df)}")
+            return df
+
+        # Ensure sorted by timestamp
+        if 'timestamp' in df.columns:
+            df = df.sort_values('timestamp')
+        
         # --- Debug Data Integrity ---
         logger.debug(f"--- Indicator Calculation Debug ---")
         logger.debug(f"DataFrame Shape: {df.shape}")

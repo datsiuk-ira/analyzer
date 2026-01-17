@@ -35,14 +35,14 @@ def render_signal_validator(current_symbol):
                 def run_async(coro):
                     return asyncio.run(coro)
 
-                df = run_async(fetcher.fetch_ohlcv(v_symbol, timeframe="1h", limit=300))
+                df = run_async(fetcher.fetch_ohlcv(v_symbol, timeframe="1h", limit=1000))
                 if df.empty:
                     st.error(f"Could not fetch data for {v_symbol}")
                     return
                 
                 # Analyze
                 analyzer = MarketAnalyzer(df)
-                df = analyzer.calculate_indicators()
+                df = analyzer.calculate_indicators(use_cache=True)
                 df = analyzer.detect_patterns()
                 df = analyzer.identify_structure()
                 

@@ -12,10 +12,10 @@ def render_backtest_view(symbol):
     
     with col1:
         st.write("Backtest Settings")
-        timeframe = st.selectbox("BT Timeframe", ["5m", "15m", "1h", "4h"], index=0)
+        timeframe = st.selectbox("BT Timeframe", ["1m", "3m", "5m", "15m", "1h", "4h"], index=0)
         strategy_type = st.selectbox("BT Strategy", ["Scalping", "Swing"])
         limit = st.number_input("Candle Limit", 500, 10000, 2000)
-        risk = st.slider("BT Risk %", 0.1, 10.0, 2.0)
+        risk = st.slider("BT Risk %", 1.0, 10.0, 5.0)
         rr = st.slider("BT R/R Ratio", 1.0, 5.0, 3.0)
         
         if st.button("🚀 Run Backtest", use_container_width=True):
@@ -40,9 +40,15 @@ def render_backtest_view(symbol):
                         }
                         
                         bt = Backtester(df, strat_class, strat_settings, risk_pct=risk, rr_ratio=rr)
+                        # The backtester handles its own indicator calculation internally
+                        # but it doesn't use the cache yet. We could optimize it too, 
+                        # but usually backtests need fresh data per run.
                         results = bt.run()
                         
-                        st.session_state.bt_results = results
+                        if "error" in results:
+                            st.error(f"Backtest Failed: {results['error']}")
+                        else:
+                            st.session_state.bt_results = results
                 finally:
                     asyncio.run(fetcher.close())
 

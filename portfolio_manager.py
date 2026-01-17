@@ -469,7 +469,9 @@ class PortfolioManager:
             "total_equity": round(float(balance + funds_in_use), 2), # Simplified equity
             "win_rate": stats.get("WinRate", 0),
             "profit_factor": stats.get("PF", 0),
-            "max_drawdown": stats.get("DD", 0)
+            "max_drawdown": stats.get("DD", 0),
+            "avg_win": stats.get("AvgWin", 0),
+            "avg_loss": stats.get("AvgLoss", 0)
         }
 
     def calculate_advanced_stats(self, portfolio_id: int) -> dict:
@@ -501,11 +503,14 @@ class PortfolioManager:
         else:
             sharpe = 0
 
-        # 4. Expectancy
-        win_rate = len(trades[trades['pnl'] > 0]) / len(trades)
+        # 4. Expectancy & Avg Win/Loss
+        wins = trades[trades['pnl'] > 0]
+        losses = trades[trades['pnl'] < 0]
+        
+        win_rate = len(wins) / len(trades)
         loss_rate = 1 - win_rate
-        avg_win = trades[trades['pnl'] > 0]['pnl'].mean() if win_rate > 0 else 0
-        avg_loss = abs(trades[trades['pnl'] < 0]['pnl'].mean()) if loss_rate > 0 else 0
+        avg_win = wins['pnl'].mean() if not wins.empty else 0
+        avg_loss = abs(losses['pnl'].mean()) if not losses.empty else 0
         expectancy = (win_rate * avg_win) - (loss_rate * avg_loss)
 
         return {
@@ -513,5 +518,7 @@ class PortfolioManager:
             "DD": round(max_dd, 2),
             "Sharpe": round(sharpe, 2),
             "Expectancy": round(expectancy, 2),
-            "WinRate": round(win_rate * 100, 1)
+            "WinRate": round(win_rate * 100, 1),
+            "AvgWin": round(float(avg_win), 2),
+            "AvgLoss": round(float(avg_loss), 2)
         }

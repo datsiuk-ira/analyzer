@@ -14,6 +14,7 @@ def render_portfolio_view(pm):
             with comp_cols[idx]:
                 st.markdown(f"**{p['name']}**")
                 st.write(f"Win Rate: {stats.get('WinRate', 0)}%")
+                st.write(f"Avg Win/Loss: {stats.get('AvgWin', 0)} / {stats.get('AvgLoss', 0)}")
                 st.write(f"Profit Factor: {stats.get('PF', 0)}")
                 st.write(f"Expectancy: {stats.get('Expectancy', 0)}")
 
@@ -30,11 +31,13 @@ def render_portfolio_view(pm):
             
             # Top Row: Metrics
             with st.container(border=True):
-                m1, m2, m3, m4 = st.columns(4)
-                m1.metric("Current Balance", f"{p['current_balance']:.2f} USDT", f"{total_pnl_pct:.2f}%")
-                m2.metric("Funds in Use", f"{metrics.get('funds_in_use', 0)} USDT")
-                m3.metric("Free Capital", f"{metrics.get('free_capital', 0)} USDT")
-                m4.metric("Win Rate", f"{metrics.get('win_rate', 0)}%")
+                m1, m2, m3, m4, m5, m6 = st.columns(6)
+                m1.metric("Balance", f"{p['current_balance']:.2f}", f"{total_pnl_pct:.2f}%")
+                m2.metric("Margin Used", f"{metrics.get('funds_in_use', 0)}")
+                m3.metric("Win Rate", f"{metrics.get('win_rate', 0)}%")
+                m4.metric("Avg Win", f"{metrics.get('avg_win', 0)}")
+                m5.metric("Avg Loss", f"{metrics.get('avg_loss', 0)}")
+                m6.metric("Drawdown", f"{metrics.get('max_drawdown', 0)}%")
             
             # Middle: Active Trades Table (Filtered)
             st.divider()

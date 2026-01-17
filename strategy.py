@@ -20,18 +20,20 @@ class Signal:
     debug_info: dict = None
     strength: float = 1.0 # Signal strength (e.g., 1.0 to 2.0 for Kelly adjustment)
     score_breakdown: dict = None # Detailed point breakdown
+    liq_tp: Optional[float] = None # Liquidity-based Take Profit level
 
 class BaseStrategy(ABC):
     """
     Abstract base class for trading strategies.
     Supports Multi-Timeframe (MTF) analysis.
     """
-    def __init__(self, df: pd.DataFrame, htf_df: Optional[pd.DataFrame], settings: dict, regime: Optional[MarketRegime] = None, sentiment: Optional[int] = 50):
+    def __init__(self, df: pd.DataFrame, htf_df: Optional[pd.DataFrame], settings: dict, regime: Optional[MarketRegime] = None, sentiment: Optional[int] = 50, institutional_data: Optional[dict] = None):
         self.df = df
         self.htf_df = htf_df
         self.settings = settings
         self.regime = regime
         self.sentiment = sentiment
+        self.institutional_data = institutional_data or {}
 
     @abstractmethod
     def generate_signal(self) -> Signal:
@@ -174,6 +176,19 @@ class ScalpingStrategy(BaseStrategy):
             if stoch_k < 20: long_score_map['Stoch_RSI'] = 0.5
             if stoch_k > 80: short_score_map['Stoch_RSI'] = 0.5
 
+        # 13. Institutional Data (OI & Funding)
+        oi_change = self.institutional_data.get('oi_change', 0)
+        funding_rate = self.institutional_data.get('funding_rate', 0)
+        
+        if oi_change > 0.05: # OI increasing > 5%
+            long_score_map['OI_Flow'] = 0.5
+            short_score_map['OI_Flow'] = 0.5
+        
+        if funding_rate > 0.0001: # High positive funding (crowded longs)
+            short_score_map['Funding'] = 0.5
+        elif funding_rate < -0.0001: # High negative funding (crowded shorts)
+            long_score_map['Funding'] = 0.5
+
         long_score = sum(long_score_map.values())
         short_score = sum(short_score_map.values())
         
@@ -203,7 +218,14 @@ class ScalpingStrategy(BaseStrategy):
             elif sq_break_long: reason += "Squeeze Breakout"
             else: reason += "Confluence Score"
             
-            signal = Signal(SignalType.BUY, reason, "Scalping", debug_info, strength=long_score/3.0, score_breakdown=long_score_map)
+            # Liquidity-based TP optimization
+            liq_tp = None
+            if self.institutional_data.get('liquidation_zones'):
+                # Find nearest liquidation zone above current price
+                zones = [z['price'] for z in self.institutional_data['liquidation_zones'] if z['price'] > current_row['close']]
+                if zones: liq_tp = min(zones)
+
+            signal = Signal(SignalType.BUY, reason, "Scalping", debug_info, strength=long_score/3.0, score_breakdown=long_score_map, liq_tp=liq_tp)
             return signal
         
         if short_score >= 3.0 and htf_info != "Bullish":
@@ -212,8 +234,15 @@ class ScalpingStrategy(BaseStrategy):
             if last_row.get('bearish_sfp'): reason += "SFP Liquidity Sweep"
             elif sq_break_short: reason += "Squeeze Breakout"
             else: reason += "Confluence Score"
+
+            # Liquidity-based TP optimization
+            liq_tp = None
+            if self.institutional_data.get('liquidation_zones'):
+                # Find nearest liquidation zone below current price
+                zones = [z['price'] for z in self.institutional_data['liquidation_zones'] if z['price'] < current_row['close']]
+                if zones: liq_tp = max(zones)
             
-            signal = Signal(SignalType.SELL, reason, "Scalping", debug_info, strength=short_score/3.0, score_breakdown=short_score_map)
+            signal = Signal(SignalType.SELL, reason, "Scalping", debug_info, strength=short_score/3.0, score_breakdown=short_score_map, liq_tp=liq_tp)
             return signal
         
         return Signal(SignalType.NEUTRAL, "No scalping confluence", "Scalping", debug_info)
@@ -327,6 +356,19 @@ class SwingStrategy(BaseStrategy):
             if stoch_k < 20: long_score_map['Stoch_RSI'] = 0.5
             if stoch_k > 80: short_score_map['Stoch_RSI'] = 0.5
 
+        # 10. Institutional Data (OI & Funding)
+        oi_change = self.institutional_data.get('oi_change', 0)
+        funding_rate = self.institutional_data.get('funding_rate', 0)
+        
+        if oi_change > 0.05:
+            long_score_map['OI_Flow'] = 0.5
+            short_score_map['OI_Flow'] = 0.5
+        
+        if funding_rate > 0.0001:
+            short_score_map['Funding'] = 0.5
+        elif funding_rate < -0.0001:
+            long_score_map['Funding'] = 0.5
+
         long_score = sum(long_score_map.values())
         short_score = sum(short_score_map.values())
 
@@ -350,10 +392,24 @@ class SwingStrategy(BaseStrategy):
         # Threshold: Score >= 3 and MTF Trend Alignment
         if long_score >= 3 and htf_info != "Bearish":
             logger.info(f"FOUND SIGNAL: LONG (Swing) | Score: {long_score} | Breakdown: {long_score_map}")
-            return Signal(SignalType.BUY, f"Swing Long (Score {long_score})", "Swing", debug_info, strength=long_score/3.0, score_breakdown=long_score_map)
+            
+            # Liquidity-based TP optimization
+            liq_tp = None
+            if self.institutional_data.get('liquidation_zones'):
+                zones = [z['price'] for z in self.institutional_data['liquidation_zones'] if z['price'] > current_row['close']]
+                if zones: liq_tp = min(zones)
+                
+            return Signal(SignalType.BUY, f"Swing Long (Score {long_score})", "Swing", debug_info, strength=long_score/3.0, score_breakdown=long_score_map, liq_tp=liq_tp)
         
         if short_score >= 3 and htf_info != "Bullish":
             logger.info(f"FOUND SIGNAL: SHORT (Swing) | Score: {short_score} | Breakdown: {short_score_map}")
-            return Signal(SignalType.SELL, f"Swing Short (Score {short_score})", "Swing", debug_info, strength=short_score/3.0, score_breakdown=short_score_map)
+            
+            # Liquidity-based TP optimization
+            liq_tp = None
+            if self.institutional_data.get('liquidation_zones'):
+                zones = [z['price'] for z in self.institutional_data['liquidation_zones'] if z['price'] < current_row['close']]
+                if zones: liq_tp = max(zones)
+
+            return Signal(SignalType.SELL, f"Swing Short (Score {short_score})", "Swing", debug_info, strength=short_score/3.0, score_breakdown=short_score_map, liq_tp=liq_tp)
 
         return Signal(SignalType.NEUTRAL, "No swing confluence", "Swing", debug_info)

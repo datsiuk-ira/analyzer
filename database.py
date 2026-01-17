@@ -30,6 +30,9 @@ def retry_db_transaction(max_retries=5, initial_delay=0.05, max_delay=0.2):
         return wrapper
     return decorator
 
+# Global flag to ensure we only log "initialized" once per process
+_DB_INITIALIZED = False
+
 class DatabaseManager:
     """
     Handles SQLite database connections and schema for paper trading.
@@ -50,8 +53,12 @@ class DatabaseManager:
 
     def _init_db(self):
         """Initializes the database schema."""
+        global _DB_INITIALIZED
         conn = self._get_connection()
         cursor = conn.cursor()
+        
+        # Enable WAL mode for better concurrency
+        conn.execute("PRAGMA journal_mode=WAL")
         
         # Portfolios table
         cursor.execute('''
@@ -117,15 +124,15 @@ class DatabaseManager:
         ''')
         
         conn.commit()
-        logger.info("Database initialized successfully.")
+        # Only log if it's the first time we're initializing in this process
+        if not _DB_INITIALIZED:
+            logger.info("Database initialized successfully.")
+            _DB_INITIALIZED = True
 
     @retry_db_transaction()
     def execute_query(self, query: str, params: tuple = ()):
         conn = self._get_connection()
         try:
-            # Enable WAL mode for better concurrency
-            conn.execute("PRAGMA journal_mode=WAL")
-            # Set shorter busy timeout if needed, but retry_db_transaction handles it too
             cursor = conn.cursor()
             cursor.execute(query, params)
             conn.commit()

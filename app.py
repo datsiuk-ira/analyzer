@@ -5,7 +5,7 @@ import time
 from datetime import datetime
 
 from config import settings
-from data_loader import BinanceFetcher
+from data_loader import BinanceFetcher, RealTimeDataStreamer
 from database import DatabaseManager
 from portfolio_manager import PortfolioManager
 from correlation import MarketRegime
@@ -26,18 +26,21 @@ def run_async(coro):
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_market_data(symbol, timeframe, htf):
-    fetcher = BinanceFetcher()
+    fetcher = st.session_state.get('fetcher', BinanceFetcher())
     try:
+        # Use session fetcher which has internal caching
         data_map = run_async(fetcher.fetch_multiple_ohlcv(symbol, [timeframe, htf]))
         return data_map
-    finally:
-        run_async(fetcher.close())
+    except Exception as e:
+        logger.error(f"Error fetching market data: {e}")
+        return {}
 
 @st.cache_data(ttl=300, show_spinner=False)
 def get_screen_results(timeframe, strat_settings):
     from screener import MarketScreener
     screener = MarketScreener(timeframe=timeframe)
-    results = run_async(screener.scan_market(strat_settings))
+    db = st.session_state.get('db')
+    results = run_async(screener.scan_market(strat_settings, db=db))
     return results, datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 def change_symbol(new_symbol):
@@ -68,6 +71,10 @@ def execute_quick_sim(coin, profile_name, signal_type, last_price, sl, tp, strat
     else:
         st.error(f"Profile {profile_name} not found")
 
+@st.cache_resource
+def get_binance_fetcher():
+    return BinanceFetcher()
+
 def init_session_state():
     if 'db' not in st.session_state:
         st.session_state.db = DatabaseManager()
@@ -79,6 +86,9 @@ def init_session_state():
         st.session_state.pm = PortfolioManager(st.session_state.db, notifier=st.session_state.notifier)
         logger.info("Initialized PortfolioManager.")
     
+    if 'fetcher' not in st.session_state:
+        st.session_state.fetcher = get_binance_fetcher()
+        
     if 'reconciled' not in st.session_state:
         st.session_state.pm.reconcile_offline_moves()
         st.session_state.reconciled = True

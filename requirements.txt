@@ -1,5 +1,6 @@
 streamlit
 ccxt
+ccxtpro
 pandas
 pandas_ta
 plotly

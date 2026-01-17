@@ -46,6 +46,14 @@ class ChartBuilder:
             name="Price"
         ), row=1, col=1)
 
+        # Volume on secondary Y-axis overlay (to avoid scale distortion)
+        fig.add_trace(go.Bar(
+            x=df['timestamp'], y=df['volume'],
+            name="Volume",
+            marker_color='rgba(128, 128, 128, 0.2)',
+            yaxis="y4" # We'll define yaxis4 in layout
+        ), row=1, col=1)
+
         # 1d. Linear Regression / Polynomial Projection (Degree 2 or 3)
         if show_projection and len(df) > 30:
             y = df['close'].values
@@ -197,11 +205,12 @@ class ChartBuilder:
             fig.add_hline(y=20, line_dash="dot", line_color="white", row=2, col=1)
 
         # 3. Volume & OBV & CVD
-        fig.add_trace(go.Bar(x=self.df['timestamp'], y=self.df['volume'], name="Volume", marker_color='gray', opacity=0.5), row=3, col=1)
-        if 'OBV' in self.df.columns:
-            fig.add_trace(go.Scatter(x=self.df['timestamp'], y=self.df['OBV'], name="OBV", line=dict(color='yellow')), row=3, col=1)
-        if 'CVD' in self.df.columns:
-            fig.add_trace(go.Scatter(x=self.df['timestamp'], y=self.df['CVD'], name="CVD", line=dict(color='orange')), row=3, col=1)
+        # Volume already added as overlay in Row 1, but we can keep Row 3 for OBV/CVD/Volume Detail
+        fig.add_trace(go.Bar(x=df['timestamp'], y=df['volume'], name="Volume Detail", marker_color='gray', opacity=0.5), row=3, col=1)
+        if 'OBV' in df.columns:
+            fig.add_trace(go.Scatter(x=df['timestamp'], y=df['OBV'], name="OBV", line=dict(color='yellow')), row=3, col=1)
+        if 'CVD' in df.columns:
+            fig.add_trace(go.Scatter(x=df['timestamp'], y=df['CVD'], name="CVD", line=dict(color='orange')), row=3, col=1)
 
         # Layout adjustments
         fig.update_layout(
@@ -209,7 +218,14 @@ class ChartBuilder:
             xaxis_rangeslider_visible=False,
             template="plotly_dark",
             showlegend=True,
-            margin=dict(l=50, r=50, t=50, b=50)
+            margin=dict(l=50, r=50, t=50, b=50),
+            yaxis4=dict(
+                title="Volume Overlay",
+                overlaying="y",
+                side="right",
+                showgrid=False,
+                range=[0, df['volume'].max() * 4] # Keep volume bars small at the bottom of Row 1
+            )
         )
         
         return fig

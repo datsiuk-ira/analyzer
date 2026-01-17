@@ -16,14 +16,22 @@ class MarketScreener:
         self.symbols = symbols
         self.timeframe = timeframe
 
-    async def scan_market(self, strat_settings: Dict[str, Any], top_limit: int = 50, fetcher: Optional[BinanceFetcher] = None) -> pd.DataFrame:
+    async def scan_market(self, strat_settings: Dict[str, Any], top_limit: int = 50, fetcher: Optional[BinanceFetcher] = None, db: Optional[Any] = None) -> pd.DataFrame:
         """
         Scans top assets by volume and returns a summary dataframe sorted by score.
+        Optimized to reduce DB calls and reuse fetcher.
         """
         local_fetcher = False
         if fetcher is None:
             fetcher = BinanceFetcher()
             local_fetcher = True
+        
+        local_db = False
+        if db is None:
+            from database import DatabaseManager
+            db = DatabaseManager()
+            local_db = True
+            
         try:
             # 1. Fetch Top 50 Volatile Pairs if no symbols provided
             if not self.symbols:
@@ -34,8 +42,22 @@ class MarketScreener:
                 return pd.DataFrame()
 
             # 2. Fetch data for all symbols
-            data_map = await fetcher.fetch_multiple_symbols_ohlcv(self.symbols, self.timeframe, limit=300)
+            data_map = await fetcher.fetch_multiple_symbols_ohlcv(self.symbols, self.timeframe, limit=1000)
             
+            # Fetch recent signal history once to avoid repeated DB calls in the loop
+            history_summary = {}
+            try:
+                history_df = db.fetch_all(
+                    "SELECT symbol, COUNT(*) as count FROM signal_history WHERE timestamp >= datetime('now', '-1 day') GROUP BY symbol"
+                )
+                if not history_df.empty:
+                    history_summary = dict(zip(history_df['symbol'], history_df['count']))
+            except Exception as e:
+                logger.error(f"Error fetching signal history summary: {e}")
+            finally:
+                if local_db:
+                    db.close()
+
             results = []
             for symbol, df in data_map.items():
                 if df.empty or len(df) < 50:
@@ -48,20 +70,26 @@ class MarketScreener:
                     ema_slow=strat_settings.get('ema_long', 50),
                     ema_trend=strat_settings.get('ema_trend', 200),
                     rsi_period=strat_settings.get('rsi_period', 14),
-                    adx_period=strat_settings.get('adx_period', 14)
+                    adx_period=strat_settings.get('adx_period', 14),
+                    use_cache=True
                 )
                 df = analyzer.detect_rsi_divergence()
                 df = analyzer.detect_patterns()
                 df = analyzer.identify_structure()
                 
                 # Apply Scalping Strategy logic for screening
-                # Use strategy_type from settings if provided, default to Scalping
                 strategy_class = ScalpingStrategy
                 strategy = strategy_class(df, None, strat_settings)
                 signal = strategy.generate_signal()
                 
                 last_row = df.iloc[-2] # Analysis based on last closed candle
                 current_row = df.iloc[-1] # For live price
+
+                # Data Validation: Skip if critical indicators are missing
+                if pd.isna(last_row.get('RSI')) or pd.isna(last_row.get('EMA_TREND')) or pd.isna(last_row.get('ADX')):
+                    logger.warning(f"Screener: Skipping {symbol} due to missing indicators.")
+                    continue
+                
                 ema_trend = last_row.get('EMA_TREND')
                 if pd.isna(ema_trend):
                     trend = "Neutral (No EMA200)"
@@ -77,30 +105,12 @@ class MarketScreener:
 
                 score = float(signal.debug_info.get('Score', 0)) if signal.debug_info else 0.0
                 
-                # Status: if Score >= 3 -> "SIGNAL", if Score >= 2 -> "NEAR MISS", else "WAIT"
-                # Logic: In database.py, we have signal_history. 
-                # If a signal for a coin appeared multiple times or on multiple timeframes, boost score.
-                # Since screener.py doesn't have direct access to DatabaseManager instance usually (it's passed in or created),
-                # we'll assume we can use a local one or passed one.
-                # Actually, in app.py, screener is created without DB. Let's add DB access to screener.
-                
                 # Boost Score based on Signal History (Confidence)
                 history_score_boost = 0.0
-                try:
-                    from database import DatabaseManager
-                    db = DatabaseManager()
-                    history = db.fetch_all(
-                        "SELECT COUNT(*) as count FROM signal_history WHERE symbol = ? AND timestamp >= datetime('now', '-1 day')", 
-                        (symbol,)
-                    )
-                    count = history.iloc[0]['count'] if not history.empty else 0
-                    if count > 5: history_score_boost = 0.5
-                    elif count > 2: history_score_boost = 0.2
-                    db.close()
-                except:
-                    pass
+                count = history_summary.get(symbol, 0)
+                if count > 5: history_score_boost = 0.5
+                elif count > 2: history_score_boost = 0.2
 
-                score = float(signal.debug_info.get('Score', 0)) if signal.debug_info else 0.0
                 score += history_score_boost
                 
                 if score >= 3.0:
