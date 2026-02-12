@@ -29,23 +29,24 @@ def render_dashboard(screener_results, last_screen_update, last_screen_time, cha
                 
                 with col5:
                     btn_col1, btn_col2 = st.columns(2)
-                    if btn_col1.button("Chart", key=f"chart_{coin}", use_container_width=True):
+                    if btn_col1.button("Chart", key=f"chart_{coin}", width="stretch"):
                         change_symbol_func(coin)
-                        st.session_state.nav_page = "📈 Coin View"
+                        # ROUND 3.1 FIX: Use pending_nav flag (read before pills widget renders)
+                        st.session_state.pending_nav = "📈 Coin View"
                         st.rerun()
                     
                     with btn_col2:
-                        with st.popover("Trade", use_container_width=True):
+                        with st.popover("Trade", width="stretch"):
                             st.write(f"Execute {coin} ({row['Signal']})")
                             profile_options = ["Moderate", "Conservative", "Aggressive"]
                             selected_profile = st.selectbox("Profile", profile_options, key=f"dash_profile_{coin}")
-                            if st.button("Confirm Execute", key=f"dash_sim_{coin}", use_container_width=True):
+                            if st.button("Confirm Execute", key=f"dash_sim_{coin}", width="stretch"):
                                 execute_quick_sim_func(
                                     coin, selected_profile, row['Signal'], price, 
                                     row['SL'], row['TP'], "Scalping", row['Strength'], 
                                     row['Breakdown'], row['ER']
                                 )
     
-    if st.button("Manual Refresh Screener", use_container_width=True):
+    if st.button("Manual Refresh Screener", width="stretch"):
         st.session_state.last_screen_update = 0
         st.rerun()

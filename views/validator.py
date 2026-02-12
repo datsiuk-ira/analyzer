@@ -20,7 +20,7 @@ def render_signal_validator(current_symbol):
             v_sl = st.number_input("Stop Loss", value=0.0, format="%.6f")
             v_tp = st.number_input("Take Profit", value=0.0, format="%.6f")
         
-        submitted = st.form_submit_button("Validate Trade Setup", use_container_width=True)
+        submitted = st.form_submit_button("Validate Trade Setup", width="stretch")
         
     if submitted:
         if v_entry == 0 or v_sl == 0 or v_tp == 0:

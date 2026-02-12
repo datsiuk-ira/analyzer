@@ -9,6 +9,16 @@ from config import settings
 from logger import logger
 
 def render_coin_view(symbol, timeframe, htf, show_heikin, strategy_type, risk_pct, rr_ratio, data_map, execute_quick_sim_func):
+    # ROUND 3 FIX: Wrap entire view in error handling for resilience
+    try:
+        _render_coin_view_internal(symbol, timeframe, htf, show_heikin, strategy_type, risk_pct, rr_ratio, data_map, execute_quick_sim_func)
+    except Exception as e:
+        st.error(f"⚠️ Error loading coin view: {e}")
+        logger.error(f"Coin view error for {symbol}: {e}", exc_info=True)
+        if st.button("🔄 Retry"):
+            st.rerun()
+
+def _render_coin_view_internal(symbol, timeframe, htf, show_heikin, strategy_type, risk_pct, rr_ratio, data_map, execute_quick_sim_func):
     df = data_map.get(timeframe)
     htf_df = data_map.get(htf)
     
@@ -35,6 +45,13 @@ def render_coin_view(symbol, timeframe, htf, show_heikin, strategy_type, risk_pc
         adx_period=settings.adx_period,
         use_cache=True
     )
+    
+    # ROUND 2 FIX: Validate indicators were calculated
+    if 'RSI' not in df.columns or 'ATR' not in df.columns:
+        st.error("⚠️ Failed to calculate indicators. Please refresh the page.")
+        logger.error(f"Indicator calculation failed for {symbol} on {timeframe}")
+        return
+    
     df = analyzer.detect_rsi_divergence()
     df = analyzer.detect_patterns()
     df = analyzer.identify_structure()
@@ -89,7 +106,7 @@ def render_coin_view(symbol, timeframe, htf, show_heikin, strategy_type, risk_pc
     # st.session_state.pm.update_positions(symbol, last_price, df.iloc[-1]['high'], df.iloc[-1]['low'], trailing_sl=trailing_sl)
 
     # UI Layout
-    h_col1, h_col2, h_col3, h_col4 = st.columns(4)
+    h_col1, h_col2, h_col3, h_col4, h_col5 = st.columns(5)
     with h_col1:
         st.metric("Price", f"{last_price}", delta=f"{((last_price/df.iloc[-2]['close'])-1)*100:.2f}%")
     with h_col2:
@@ -99,6 +116,28 @@ def render_coin_view(symbol, timeframe, htf, show_heikin, strategy_type, risk_pc
         st.metric("Efficiency (ER)", f"{er:.2f}", "Efficient" if er > 0.3 else "Noisy")
     with h_col4:
         st.metric("Fear & Greed", fng_index)
+    with h_col5:
+        # ROUND 3: ML Prediction Display
+        try:
+            from prediction import PredictionEngine
+            predictor = PredictionEngine(df)
+            ensemble = predictor.get_ensemble_score()
+            if ensemble is not None:
+                if ensemble > 0.55:
+                    pred_label = "Bullish"
+                    pred_color = "🟢"
+                elif ensemble < 0.45:
+                    pred_label = "Bearish"
+                    pred_color = "🔴"
+                else:
+                    pred_label = "Neutral"
+                    pred_color = "⚪"
+                st.metric("ML Prediction", f"{pred_color} {pred_label}", f"{ensemble:.0%}")
+            else:
+                st.metric("ML Prediction", "N/A")
+        except Exception as e:
+            st.metric("ML Prediction", "N/A")
+            logger.debug(f"Prediction display failed: {e}")
 
     st.divider()
 
@@ -122,13 +161,13 @@ def render_coin_view(symbol, timeframe, htf, show_heikin, strategy_type, risk_pc
             else:
                 pass
 
-        if btn_long.button("🚀 GO LONG", use_container_width=True, type="primary"):
+        if btn_long.button("🚀 GO LONG", width="stretch", type="primary"):
             handle_trade_button("LONG")
         
-        if btn_short.button("📉 GO SHORT", use_container_width=True, type="secondary"):
+        if btn_short.button("📉 GO SHORT", width="stretch", type="secondary"):
             handle_trade_button("SHORT")
             
-        if btn_refresh.button("🔄 Refresh Data", use_container_width=True):
+        if btn_refresh.button("🔄 Refresh Data", width="stretch"):
             st.rerun()
 
         # Chart
@@ -138,7 +177,7 @@ def render_coin_view(symbol, timeframe, htf, show_heikin, strategy_type, risk_pc
             signal_data = {'type': signal.type.value, 'entry': last_price, 'sl': sl, 'tp': tp}
         
         fig = chart_builder.build_chart(symbol, sr_zones=analyzer.sr_zones, show_heikin=show_heikin, signal_data=signal_data, show_projection=st.session_state.get('show_projection', True))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     with col_side:
         with st.container(border=True):
@@ -169,5 +208,5 @@ def render_coin_view(symbol, timeframe, htf, show_heikin, strategy_type, risk_pc
         with st.container(border=True):
             st.subheader("Simulate")
             profile = st.selectbox("Portfolio", ["Moderate", "Conservative", "Aggressive"], key="side_sim_profile")
-            if st.button("Execute Sim Trade", use_container_width=True):
+            if st.button("Execute Sim Trade", width="stretch"):
                 execute_quick_sim_func(symbol, profile, signal.type.value, last_price, sl, tp, strategy_type, signal.strength, signal.score_breakdown, er)

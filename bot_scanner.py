@@ -26,12 +26,14 @@ class BotScanner:
         self.coinglass = CoinglassConnector()
         self.streamer = None
         self.timeframes = ["1m", "3m", "5m", "15m"]
-        self.min_score = 6.5
+        self.min_score = 6.0
         # Cache to prevent double alerts for the same candle
         self.alert_cache: Set[str] = set()
         # In-memory signal cache for interactive buttons
         self.signal_cache: Dict[str, dict] = {}
         self.symbols = settings.symbols
+        # FIX #6: Institutional data cache with TTL
+        self._inst_cache: Dict[str, dict] = {}
 
     def setup_callbacks(self):
         """Sets up Telegram callback handlers."""
@@ -101,19 +103,33 @@ class BotScanner:
                 logger.error(f"Error handling callback: {e}")
                 self.notifier.bot.answer_callback_query(call.id, "⚠️ System Error")
 
+
     async def _process_stream(self):
         """Processes real-time updates from WebSocket queue."""
         logger.info("Real-Time Stream Processing started.")
+        # FIX #13: Track running extremes between OHLCV updates
+        running_extremes = {}  # symbol -> {'high': float, 'low': float}
+        
         while True:
             try:
                 update = await self.streamer.queue.get()
                 if update['type'] == 'trade':
-                    # Fast SL/TP check for open positions
+                    symbol = update['symbol']
+                    price = update['price']
+                    
+                    # FIX #13: Track high/low for accurate SL/TP detection
+                    if symbol not in running_extremes:
+                        running_extremes[symbol] = {'high': price, 'low': price}
+                    else:
+                        running_extremes[symbol]['high'] = max(running_extremes[symbol]['high'], price)
+                        running_extremes[symbol]['low'] = min(running_extremes[symbol]['low'], price)
+                    
+                    # Fast SL/TP check for open positions with proper high/low
                     self.pm.update_positions(
-                        update['symbol'], 
-                        update['price'], 
-                        update['price'], # Using current price as high/low for fast WS update
-                        update['price']
+                        symbol, 
+                        price,
+                        running_extremes[symbol]['high'],
+                        running_extremes[symbol]['low']
                     )
                 elif update['type'] == 'orderbook':
                     # Could be used for imbalance analysis
@@ -121,6 +137,39 @@ class BotScanner:
             except Exception as e:
                 logger.error(f"Error processing stream update: {e}")
                 await asyncio.sleep(1)
+
+    async def _fetch_cached_institutional(self, symbol: str) -> dict:
+        """FIX #6: Fetch institutional data with caching (TTL: 120s)"""
+        cache_key = symbol
+        now = time.time()
+        if cache_key in self._inst_cache and now - self._inst_cache[cache_key]['ts'] < 120:
+            return self._inst_cache[cache_key]['data']
+        
+        # Batch all 3 API calls in parallel
+        oi, funding, liq = await asyncio.gather(
+            self.coinglass.fetch_open_interest(symbol),
+            self.coinglass.fetch_funding_rate(symbol),
+            self.coinglass.fetch_liquidation_heatmap(symbol)
+        )
+        
+        # Calculate OI change
+        oi_change = 0
+        if isinstance(oi, list) and len(oi) > 1:
+            oi_change = (oi[0].get('openInterest', 0) / oi[1].get('openInterest', 1)) - 1
+        
+        data = {
+            'oi_change': oi_change,
+            'funding_rate': funding,
+            'liquidation_zones': liq
+        }
+        self._inst_cache[cache_key] = {'data': data, 'ts': now}
+        return data
+
+    async def _fetch_all_institutional(self, symbols: list) -> dict:
+        """FIX #6: Pre-fetch all institutional data in parallel"""
+        tasks = [self._fetch_cached_institutional(symbol) for symbol in symbols]
+        results = await asyncio.gather(*tasks)
+        return dict(zip(symbols, results))
 
     async def run(self):
         logger.info(f"INSTITUTIONAL BOT SCANNER started. Min Score: {self.min_score}")
@@ -169,6 +218,14 @@ class BotScanner:
             try:
                 start_time = time.time()
                 
+                # A6 FIX: Skip low-liquidity window (configurable)
+                from datetime import datetime, timezone
+                utc_hour = datetime.now(timezone.utc).hour
+                if utc_hour in settings.low_liquidity_hours:
+                    logger.debug(f"Skipping scan during low-liquidity hour: UTC {utc_hour}:00")
+                    await asyncio.sleep(self.interval)
+                    continue
+                
                 # Fetch global Daily ATR for Vol Targeting once per loop
                 market_data = await self.fetcher.fetch_ohlcv("BTC/USDT", timeframe='1d', limit=14)
                 daily_atr = None
@@ -183,24 +240,19 @@ class BotScanner:
                     # Fetch data for all symbols
                     data_map = await self.fetcher.fetch_multiple_symbols_ohlcv(self.symbols, tf, limit=200)
                     
+                    # FIX #6: Pre-fetch ALL institutional data in parallel BEFORE the symbol loop
+                    symbols_to_fetch = list(data_map.keys())
+                    inst_data_map = await self._fetch_all_institutional(symbols_to_fetch)
+                    
                     for symbol, df in data_map.items():
                         if df.empty or len(df) < 50: continue
                         
-                        # 1. Enrich with Institutional Data
-                        oi_data = await self.coinglass.fetch_open_interest(symbol)
-                        funding = await self.coinglass.fetch_funding_rate(symbol)
-                        liq_zones = await self.coinglass.fetch_liquidation_heatmap(symbol)
-                        
-                        oi_change = 0
-                        if isinstance(oi_data, list) and len(oi_data) > 1:
-                            # Calculate % change in OI
-                            oi_change = (oi_data[0].get('openInterest', 0) / oi_data[1].get('openInterest', 1)) - 1
-
-                        inst_data = {
-                            'oi_change': oi_change,
-                            'funding_rate': funding,
-                            'liquidation_zones': liq_zones
-                        }
+                        # 1. Get pre-fetched institutional data (no await needed!)
+                        inst_data = inst_data_map.get(symbol, {
+                            'oi_change': 0,
+                            'funding_rate': 0,
+                            'liquidation_zones': []
+                        })
 
                         # 2. Analyze & Strategy
                         analyzer = MarketAnalyzer(df)
@@ -234,12 +286,24 @@ class BotScanner:
                                 
                                 if alert_key not in self.alert_cache:
                                     signal_id = str(uuid.uuid4())[:8]
+                                    
+                                    # FIX #14: Use ATR-based SL/TP instead of hardcoded 2%/4%
+                                    from risk_manager import RiskCalculator
+                                    last_row = df.iloc[-2]  # Use completed candle
+                                    atr_val = last_row.get('ATR', df.iloc[-1]['close'] * 0.02)
+                                    risk_calc = RiskCalculator(10000, 1.0, 3.0)
+                                    sl, tp = risk_calc.calculate_levels(
+                                        df.iloc[-1]['close'], 
+                                        atr_val, 
+                                        signal.type.value
+                                    )
+                                    
                                     self.signal_cache[signal_id] = {
                                         'symbol': symbol,
                                         'direction': signal.type.value,
                                         'price': df.iloc[-1]['close'],
-                                        'sl': df.iloc[-1]['close'] * 0.98 if signal.type == SignalType.BUY else df.iloc[-1]['close'] * 1.02, # Fallback sl
-                                        'tp': df.iloc[-1]['close'] * 1.04 if signal.type == SignalType.BUY else df.iloc[-1]['close'] * 0.96, # Fallback tp
+                                        'sl': sl,
+                                        'tp': tp,
                                         'breakdown': signal.score_breakdown,
                                         'daily_atr': daily_atr,
                                         'liq_tp': signal.liq_tp

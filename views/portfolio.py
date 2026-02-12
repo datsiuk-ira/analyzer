@@ -51,7 +51,7 @@ def render_portfolio_view(pm):
                 if 'leverage' in active_trades.columns:
                     active_trades = active_trades.rename(columns={'leverage': 'Lev (x)'})
                 cols_to_show = ['id', 'symbol', 'direction', 'entry_price', 'quantity', 'Lev (x)', 'status', 'entry_time']
-                st.dataframe(active_trades[[c for c in cols_to_show if c in active_trades.columns]], use_container_width=True)
+                st.dataframe(active_trades[[c for c in cols_to_show if c in active_trades.columns]], width="stretch")
             else:
                 st.info("No active trades for this portfolio.")
             
@@ -78,7 +78,7 @@ def render_portfolio_view(pm):
                     )
                     
                     cols_to_show = ['id', 'symbol', 'direction', 'pnl', 'status', 'MFE %', 'MAE %', 'exit_time']
-                    st.dataframe(history[[c for c in cols_to_show if c in history.columns]].round(2), use_container_width=True)
+                    st.dataframe(history[[c for c in cols_to_show if c in history.columns]].round(2), width="stretch")
                 else:
                     st.write("No history.")
             
@@ -92,6 +92,6 @@ def render_portfolio_view(pm):
                     ORDER BY l.timestamp DESC LIMIT 10
                 """, (int(p_id),))
                 if not logs.empty:
-                    st.dataframe(logs[['timestamp', 'symbol', 'event_type', 'price_reached', 'distance_pct']], use_container_width=True)
+                    st.dataframe(logs[['timestamp', 'symbol', 'event_type', 'price_reached', 'distance_pct']], width="stretch")
                 else:
                     st.write("No logs.")

@@ -1,9 +1,13 @@
-import streamlit as st
 import pandas as pd
 import pandas_ta as ta
 import numpy as np
+import hashlib
 from typing import Optional, List, Dict
 from logger import logger
+
+# Module-level cache (works in ALL contexts: Streamlit, async, tests)
+_indicator_cache = {}
+_CACHE_MAX_SIZE = 50
 
 class MarketAnalyzer:
     """
@@ -11,16 +15,6 @@ class MarketAnalyzer:
     """
     def __init__(self, df: pd.DataFrame):
         self.df = df
-
-    @st.cache_data(show_spinner=False)
-    def calculate_indicators_cached(_df, **kwargs):
-        """
-        Static helper to cache heavy indicator calculations.
-        _df is prefixed with underscore to exclude it from hashing (optional, but good for large DFs).
-        Actually, streamlit hashes the dataframe, which is fine if it's not too huge.
-        """
-        analyzer = MarketAnalyzer(_df)
-        return analyzer._calculate_indicators_internal(**kwargs)
 
     def calculate_indicators(self, 
                              ema_fast: int = 20, 
@@ -36,16 +30,48 @@ class MarketAnalyzer:
                              use_cache: bool = True) -> pd.DataFrame:
         """
         Calculates technical indicators using pandas_ta with optional caching.
+        ROUND 2 FIX: Replaced @st.cache_data with context-independent dict cache.
         """
         if use_cache:
-            # Hashable key for parameters
-            params = {
-                'ema_fast': ema_fast, 'ema_slow': ema_slow, 'ema_trend': ema_trend,
-                'rsi_period': rsi_period, 'atr_period': atr_period, 'adx_period': adx_period,
-                'stoch_rsi_period': stoch_rsi_period, 'stoch_period': stoch_period,
-                'stoch_k': stoch_k, 'stoch_d': stoch_d
-            }
-            return MarketAnalyzer.calculate_indicators_cached(self.df, **params)
+            # Hash DataFrame for cache invalidation
+            df_hash = hashlib.md5(
+                pd.util.hash_pandas_object(self.df).values.tobytes()
+            ).hexdigest()
+            
+            # Create hashable cache key from all parameters
+            cache_key = (
+                df_hash, ema_fast, ema_slow, ema_trend,
+                rsi_period, atr_period, adx_period,
+                stoch_rsi_period, stoch_period, stoch_k, stoch_d
+            )
+            
+            # Check cache
+            if cache_key in _indicator_cache:
+                logger.debug(f"Indicator cache HIT for hash {df_hash[:8]}")
+                self.df = _indicator_cache[cache_key].copy()
+                return self.df
+            
+            # Calculate indicators
+            result = self._calculate_indicators_internal(
+                ema_fast=ema_fast, ema_slow=ema_slow, ema_trend=ema_trend,
+                rsi_period=rsi_period, atr_period=atr_period, adx_period=adx_period,
+                stoch_rsi_period=stoch_rsi_period, stoch_period=stoch_period,
+                stoch_k=stoch_k, stoch_d=stoch_d
+            )
+            
+            # Evict oldest entry if cache is full (FIFO)
+            if len(_indicator_cache) >= _CACHE_MAX_SIZE:
+                oldest_key = next(iter(_indicator_cache))
+                _indicator_cache.pop(oldest_key)
+                logger.debug(f"Indicator cache evicted oldest entry")
+            
+            # Store in cache
+            _indicator_cache[cache_key] = result.copy()
+            logger.debug(f"Indicator cache MISS for hash {df_hash[:8]}, stored")
+            
+            # Update self.df so subsequent calls work on indicator-enriched data
+            self.df = result
+            return self.df
             
         return self._calculate_indicators_internal(
             ema_fast=ema_fast, ema_slow=ema_slow, ema_trend=ema_trend,
@@ -191,6 +217,19 @@ class MarketAnalyzer:
             df['OBV'] = ta.obv(df['close'], df['volume'])
             df['CMF'] = ta.cmf(df['high'], df['low'], df['close'], df['volume'], length=20)
             df['VOL_MA'] = ta.sma(df['volume'], length=ema_fast)
+            # ROUND 4 FIX: Add VWAP for institutional price benchmark
+            # A7 FIX: Daily-anchored VWAP (resets each day)
+            if 'timestamp' in df.columns:
+                df['_date'] = df['timestamp'].dt.date
+                vwap_parts = []
+                for _, group in df.groupby('_date'):
+                    v = ta.vwap(group['high'], group['low'], group['close'], group['volume'])
+                    vwap_parts.append(v)
+                df['VWAP'] = pd.concat(vwap_parts)
+                df.drop(columns=['_date'], inplace=True)
+            else:
+                # Fallback for data without timestamp
+                df['VWAP'] = ta.vwap(df['high'], df['low'], df['close'], df['volume'])
         except Exception as e:
             logger.error(f"Error calculating volume indicators: {e}")
         
@@ -231,32 +270,48 @@ class MarketAnalyzer:
                 # Delta = TakerBuyVol - (TotalVol - TakerBuyVol)
                 df['delta'] = df['taker_buy_vol'] - (df['volume'] - df['taker_buy_vol'])
                 df['CVD'] = df['delta'].cumsum()
-            
-            # Ichimoku Cloud
-            try:
-                ichimoku, _ = ta.ichimoku(df['high'], df['low'], df['close'])
-                if ichimoku is not None:
-                    df = pd.concat([df, ichimoku], axis=1)
-                else:
-                    logger.warning("ta.ichimoku returned None")
-            except Exception as e:
-                logger.error(f"Error calculating Ichimoku: {e}")
-
-            # Stochastic RSI
-            try:
-                stoch_rsi = ta.stochrsi(df['close'], length=stoch_rsi_period, rsi_length=rsi_period, k=stoch_k, d=stoch_d)
-                if stoch_rsi is not None:
-                    df = pd.concat([df, stoch_rsi], axis=1)
-                else:
-                    logger.warning("ta.stochrsi returned None")
-            except Exception as e:
-                logger.error(f"Error calculating Stochastic RSI: {e}")
 
         except Exception as e:
-            logger.error(f"Error calculating indicators: {e}")
+            logger.error(f"Error calculating squeeze indicators: {e}")
             df['is_squeeze'] = False
             df['squeeze_breakout_long'] = False
             df['squeeze_breakout_short'] = False
+
+        # Ichimoku Cloud (independent of squeeze)
+        try:
+            ichimoku, _ = ta.ichimoku(df['high'], df['low'], df['close'])
+            if ichimoku is not None:
+                df = pd.concat([df, ichimoku], axis=1)
+            else:
+                logger.warning("ta.ichimoku returned None")
+        except Exception as e:
+            logger.error(f"Error calculating Ichimoku: {e}")
+
+        # Stochastic RSI (independent of squeeze)
+        try:
+            stoch_rsi = ta.stochrsi(df['close'], length=stoch_rsi_period, rsi_length=rsi_period, k=stoch_k, d=stoch_d)
+            if stoch_rsi is not None:
+                df = pd.concat([df, stoch_rsi], axis=1)
+            else:
+                logger.warning("ta.stochrsi returned None")
+        except Exception as e:
+            logger.error(f"Error calculating Stochastic RSI: {e}")
+
+        # ROUND 5: Rate of Change (ROC) — momentum oscillator
+        try:
+            roc = ta.roc(df['close'], length=10)
+            if roc is not None:
+                df['ROC'] = roc
+        except Exception as e:
+            logger.error(f"Error calculating ROC: {e}")
+
+        # ROUND 5: Williams %R — overbought/oversold oscillator
+        try:
+            willr = ta.willr(df['high'], df['low'], df['close'], length=14)
+            if willr is not None:
+                df['WILLR'] = willr
+        except Exception as e:
+            logger.error(f"Error calculating Williams %R: {e}")
 
         self.df = df # Update instance state
         logger.debug(f"Indicator calculation complete. Final shape: {df.shape}")
@@ -313,12 +368,19 @@ class MarketAnalyzer:
             self.df.loc[low_pivots[bull_div_mask].index, 'bullish_div'] = True
 
         # Bearish Divergence: Higher High in Price + Lower High in RSI
+        # FIX: Add distance constraint - pivots must be within 30 candles
         if len(high_pivots) > 1:
             # Compare current high pivot with previous high pivot
             high_pivots['prev_high'] = high_pivots['high'].shift(1)
             high_pivots['prev_rsi'] = high_pivots['RSI'].shift(1)
+            high_pivots['prev_idx'] = high_pivots.index.to_series().shift(1)
             
-            bear_div_mask = (high_pivots['high'] > high_pivots['prev_high']) & \
+            # Distance filter: pivots must be within 30 candles
+            distance = high_pivots.index.to_series() - high_pivots['prev_idx']
+            distance_ok = distance <= 30
+            
+            bear_div_mask = distance_ok & \
+                            (high_pivots['high'] > high_pivots['prev_high']) & \
                             (high_pivots['RSI'] < high_pivots['prev_rsi'])
             
             self.df.loc[high_pivots[bear_div_mask].index, 'bearish_div'] = True
@@ -393,11 +455,21 @@ class MarketAnalyzer:
         low_pivots = self.df[is_local_low].copy()
         high_pivots = self.df[is_local_high].copy()
 
-        # 1. Double Bottom / Top (Existing logic)
+        # 1. Double Bottom / Top - FIX: ATR-adaptive threshold + distance constraint
         if len(low_pivots) > 1:
             low_pivots['prev_low'] = low_pivots['low'].shift(1)
-            price_threshold = 0.03
-            is_w = (abs(low_pivots['low'] - low_pivots['prev_low']) / low_pivots['prev_low']) <= price_threshold
+            low_pivots['prev_idx'] = low_pivots.index.to_series().shift(1)
+            
+            # ATR-adaptive threshold instead of hardcoded 3%
+            avg_atr = self.df['ATR'].mean() if 'ATR' in self.df.columns else self.df['close'].mean() * 0.015
+            price_threshold = (avg_atr * 2) / low_pivots['prev_low']
+            
+            # Distance constraint: max 40 candles between pivots
+            distance = low_pivots.index.to_series() - low_pivots['prev_idx']
+            distance_ok = distance <= 40
+            
+            is_w = distance_ok & ((abs(low_pivots['low'] - low_pivots['prev_low']) / low_pivots['prev_low']) <= price_threshold)
+            
             for idx in low_pivots[is_w].index:
                 prev_indices = low_pivots.index[low_pivots.index < idx]
                 if len(prev_indices) > 0:
@@ -410,8 +482,18 @@ class MarketAnalyzer:
 
         if len(high_pivots) > 1:
             high_pivots['prev_high'] = high_pivots['high'].shift(1)
-            price_threshold = 0.03
-            is_m = (abs(high_pivots['high'] - high_pivots['prev_high']) / high_pivots['prev_high']) <= price_threshold
+            high_pivots['prev_idx'] = high_pivots.index.to_series().shift(1)
+            
+            # ATR-adaptive threshold instead of hardcoded 3%
+            avg_atr = self.df['ATR'].mean() if 'ATR' in self.df.columns else self.df['close'].mean() * 0.015
+            price_threshold = (avg_atr * 2) / high_pivots['prev_high']
+            
+            # Distance constraint: max 40 candles between pivots
+            distance = high_pivots.index.to_series() - high_pivots['prev_idx']
+            distance_ok = distance <= 40
+            
+            is_m = distance_ok & ((abs(high_pivots['high'] - high_pivots['prev_high']) / high_pivots['prev_high']) <= price_threshold)
+            
             for idx in high_pivots[is_m].index:
                 prev_indices = high_pivots.index[high_pivots.index < idx]
                 if len(prev_indices) > 0:
@@ -422,20 +504,43 @@ class MarketAnalyzer:
                         if valley < high_pivots.loc[idx, 'high'] * 0.99:
                             self.df.at[idx, 'pattern_double_top'] = True
 
-        # 2. Head & Shoulders
+        # 2. Head & Shoulders - FIX: Sliding window + neckline validation
         if len(high_pivots) >= 3:
-            # Look at last 3 high pivots
-            last_3 = high_pivots.tail(3)
-            h1, h2, h3 = last_3['high'].values
-            if h2 > h1 and h2 > h3 and abs(h1 - h3) / h1 < 0.03:
-                self.df.at[last_3.index[-1], 'pattern_head_shoulders'] = True
+            # Check every consecutive triple of pivots
+            for i in range(len(high_pivots) - 2):
+                triple = high_pivots.iloc[i:i+3]
+                h1, h2, h3 = triple['high'].values
+                # Head must be highest, shoulders roughly equal
+                if h2 > h1 and h2 > h3 and abs(h1 - h3) / h1 < 0.03:
+                    # Validate neckline: find troughs between shoulders
+                    idx1, idx2, idx3 = triple.index[0], triple.index[1], triple.index[2]
+                    mid1 = self.df.loc[idx1:idx2]
+                    mid2 = self.df.loc[idx2:idx3]
+                    if len(mid1) > 0 and len(mid2) > 0:
+                        neckline1 = mid1['low'].min()
+                        neckline2 = mid2['low'].min()
+                        # Neckline should be roughly flat
+                        if abs(neckline1 - neckline2) / neckline1 < 0.02:
+                            self.df.at[idx3, 'pattern_head_shoulders'] = True
 
-        # 3. Inverted Head & Shoulders
+        # 3. Inverted Head & Shoulders - FIX: Sliding window + neckline validation
         if len(low_pivots) >= 3:
-            last_3 = low_pivots.tail(3)
-            l1, l2, l3 = last_3['low'].values
-            if l2 < l1 and l2 < l3 and abs(l1 - l3) / l1 < 0.03:
-                self.df.at[last_3.index[-1], 'pattern_inv_head_shoulders'] = True
+            # Check every consecutive triple of pivots
+            for i in range(len(low_pivots) - 2):
+                triple = low_pivots.iloc[i:i+3]
+                l1, l2, l3 = triple['low'].values
+                # Head must be lowest, shoulders roughly equal
+                if l2 < l1 and l2 < l3 and abs(l1 - l3) / l1 < 0.03:
+                    # Validate neckline: find peaks between shoulders
+                    idx1, idx2, idx3 = triple.index[0], triple.index[1], triple.index[2]
+                    mid1 = self.df.loc[idx1:idx2]
+                    mid2 = self.df.loc[idx2:idx3]
+                    if len(mid1) > 0 and len(mid2) > 0:
+                        neckline1 = mid1['high'].max()
+                        neckline2 = mid2['high'].max()
+                        # Neckline should be roughly flat
+                        if abs(neckline1 - neckline2) / neckline1 < 0.02:
+                            self.df.at[idx3, 'pattern_inv_head_shoulders'] = True
 
     def identify_structure(self, window: int = 5) -> pd.DataFrame:
         """
@@ -445,6 +550,10 @@ class MarketAnalyzer:
         # --- SFP Detection (Institutional) ---
         # Detect if Price broke a previous Swing Low/High but closed back inside.
         # Use iloc[-2] for detection to avoid look-ahead bias.
+        # FIX: Only mark the specific candle, not broadcast to all rows
+        self.df['bullish_sfp'] = False
+        self.df['bearish_sfp'] = False
+        
         if len(self.df) > window * 2 + 1:
             # Look back further to find the pivot
             lookback_range = self.df.iloc[-50:-2] if len(self.df) > 50 else self.df.iloc[:-2]
@@ -454,11 +563,11 @@ class MarketAnalyzer:
             # Completed candle (iloc[-2])
             last_closed = self.df.iloc[-2]
             
-            self.df['bullish_sfp'] = (last_closed['low'] < prev_low_pivot) & (last_closed['close'] > prev_low_pivot)
-            self.df['bearish_sfp'] = (last_closed['high'] > prev_high_pivot) & (last_closed['close'] < prev_high_pivot)
-        else:
-            self.df['bullish_sfp'] = False
-            self.df['bearish_sfp'] = False
+            # Only mark the specific candle where SFP occurred
+            if (last_closed['low'] < prev_low_pivot) and (last_closed['close'] > prev_low_pivot):
+                self.df.iloc[-2, self.df.columns.get_loc('bullish_sfp')] = True
+            if (last_closed['high'] > prev_high_pivot) and (last_closed['close'] < prev_high_pivot):
+                self.df.iloc[-2, self.df.columns.get_loc('bearish_sfp')] = True
 
         # --- Kaufman Efficiency Ratio (Noise Filter) ---
         net_change = (self.df['close'] - self.df['close'].shift(10)).abs()

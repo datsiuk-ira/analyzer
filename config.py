@@ -48,6 +48,10 @@ class Settings:
             "4h": "1d",
             "1d": "1w"
         }
+        
+        # Low-liquidity hours filter (UTC hours to skip trading)
+        self.low_liquidity_hours: List[int] = [0, 1, 2, 3]  # UTC 00:00-04:00
+
 
         # Telegram credentials
         self.telegram_bot_token: Optional[str] = os.getenv("TELEGRAM_BOT_TOKEN")

@@ -219,6 +219,13 @@ class ChartBuilder:
             template="plotly_dark",
             showlegend=True,
             margin=dict(l=50, r=50, t=50, b=50),
+            # ROUND 4 FIX: Center chart on last 100 candles for readability
+            xaxis=dict(
+                range=[
+                    df['timestamp'].iloc[-100] if len(df) > 100 else df['timestamp'].iloc[0],
+                    df['timestamp'].iloc[-1] + (df['timestamp'].iloc[-1] - df['timestamp'].iloc[-2]) * 5
+                ]
+            ),
             yaxis4=dict(
                 title="Volume Overlay",
                 overlaying="y",

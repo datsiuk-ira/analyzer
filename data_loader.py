@@ -31,7 +31,7 @@ class RealTimeDataStreamer:
             'options': {'defaultType': 'future'},
             'enableRateLimit': True,
         })
-        self.queue = asyncio.Queue()
+        self.queue = asyncio.Queue(maxsize=1000)  # Bounded queue to prevent OOM
         self.price_cache: Dict[str, float] = {}
         self.orderbook_cache: Dict[str, Dict[str, Any]] = {}
         self.is_running = False
@@ -52,14 +52,29 @@ class RealTimeDataStreamer:
                 trades = await self.exchange.watch_trades(symbol)
                 for trade in trades:
                     self.price_cache[symbol] = trade['price']
-                    await self.queue.put({
-                        'type': 'trade',
-                        'symbol': symbol,
-                        'price': trade['price'],
-                        'amount': trade['amount'],
-                        'side': trade['side'],
-                        'timestamp': trade['timestamp']
-                    })
+                    try:
+                        self.queue.put_nowait({
+                            'type': 'trade',
+                            'symbol': symbol,
+                            'price': trade['price'],
+                            'amount': trade['amount'],
+                            'side': trade['side'],
+                            'timestamp': trade['timestamp']
+                        })
+                    except asyncio.QueueFull:
+                        # Drop oldest, keep latest (backpressure handling)
+                        try:
+                            self.queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            pass
+                        self.queue.put_nowait({
+                            'type': 'trade',
+                            'symbol': symbol,
+                            'price': trade['price'],
+                            'amount': trade['amount'],
+                            'side': trade['side'],
+                            'timestamp': trade['timestamp']
+                        })
             except Exception as e:
                 logger.error(f"WS Trade Error ({symbol}): {e}")
                 await asyncio.sleep(5)
@@ -73,11 +88,23 @@ class RealTimeDataStreamer:
                     'asks': orderbook['asks'][:5],
                     'timestamp': orderbook['timestamp']
                 }
-                await self.queue.put({
-                    'type': 'orderbook',
-                    'symbol': symbol,
-                    **self.orderbook_cache[symbol]
-                })
+                try:
+                    self.queue.put_nowait({
+                        'type': 'orderbook',
+                        'symbol': symbol,
+                        **self.orderbook_cache[symbol]
+                    })
+                except asyncio.QueueFull:
+                    # Drop oldest, keep latest (backpressure handling)
+                    try:
+                        self.queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        pass
+                    self.queue.put_nowait({
+                        'type': 'orderbook',
+                        'symbol': symbol,
+                        **self.orderbook_cache[symbol]
+                    })
             except Exception as e:
                 logger.error(f"WS Orderbook Error ({symbol}): {e}")
                 await asyncio.sleep(5)
@@ -100,6 +127,18 @@ class CoinglassConnector:
         self.api_key = api_key or os.getenv("COINGLASS_API_KEY")
         self.base_url = "https://open-api.coinglass.com/public/v2"
         self.headers = {"accept": "application/json", "coinglassApi": self.api_key} if self.api_key else {}
+        self._session = None  # FIX: Reuse session across requests
+
+    async def _get_session(self):
+        """Get or create aiohttp session - FIX: Reuse connection"""
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(headers=self.headers)
+        return self._session
+
+    async def close(self):
+        """Close the session when done"""
+        if self._session and not self._session.closed:
+            await self._session.close()
 
     async def fetch_open_interest(self, symbol: str) -> Dict[str, Any]:
         """Tracks % change in Open Interest."""
@@ -107,14 +146,14 @@ class CoinglassConnector:
         # Mocking for now if API key is missing, or use public endpoints if available
         # Implementation depends on Coinglass API structure
         try:
-            async with aiohttp.ClientSession() as session:
-                # Example endpoint for OI
-                base_symbol = symbol.split('/')[0]
-                url = f"{self.base_url}/open_interest?symbol={base_symbol}"
-                async with session.get(url, headers=self.headers) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        return data.get('data', [])
+            session = await self._get_session()  # FIX: Reuse session
+            # Example endpoint for OI
+            base_symbol = symbol.split('/')[0]
+            url = f"{self.base_url}/open_interest?symbol={base_symbol}"
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data.get('data', [])
         except Exception as e:
             logger.error(f"Coinglass OI Error: {e}")
         return {}
@@ -123,16 +162,16 @@ class CoinglassConnector:
         """Monitor for crowded trades."""
         if not self.api_key: return 0.0
         try:
-            async with aiohttp.ClientSession() as session:
-                base_symbol = symbol.split('/')[0]
-                url = f"{self.base_url}/funding_rate?symbol={base_symbol}"
-                async with session.get(url, headers=self.headers) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        # Simplified: return average funding rate from main exchanges
-                        rates = data.get('data', [])
-                        if rates:
-                            return sum([r.get('uMarginRate', 0) for r in rates]) / len(rates)
+            session = await self._get_session()  # FIX: Reuse session
+            base_symbol = symbol.split('/')[0]
+            url = f"{self.base_url}/funding_rate?symbol={base_symbol}"
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    # Simplified: return average funding rate from main exchanges
+                    rates = data.get('data', [])
+                    if rates:
+                        return sum([r.get('uMarginRate', 0) for r in rates]) / len(rates)
         except Exception as e:
             logger.error(f"Coinglass Funding Error: {e}")
         return 0.0

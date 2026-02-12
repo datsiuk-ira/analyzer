@@ -42,7 +42,8 @@ class MarketScreener:
                 return pd.DataFrame()
 
             # 2. Fetch data for all symbols
-            data_map = await fetcher.fetch_multiple_symbols_ohlcv(self.symbols, self.timeframe, limit=1000)
+            # FIX #9: Reduced from 1000 to 250 (200 warmup + 50 buffer is sufficient)
+            data_map = await fetcher.fetch_multiple_symbols_ohlcv(self.symbols, self.timeframe, limit=250)
             
             # Fetch recent signal history once to avoid repeated DB calls in the loop
             history_summary = {}
@@ -105,15 +106,10 @@ class MarketScreener:
 
                 score = float(signal.debug_info.get('Score', 0)) if signal.debug_info else 0.0
                 
-                # Boost Score based on Signal History (Confidence)
-                history_score_boost = 0.0
-                count = history_summary.get(symbol, 0)
-                if count > 5: history_score_boost = 0.5
-                elif count > 2: history_score_boost = 0.2
-
-                score += history_score_boost
+                # Signal history as metadata only (not score boost — avoid feedback loop)
+                history_count = history_summary.get(symbol, 0)
                 
-                if score >= 3.0:
+                if score >= 4.0:
                     status = "🟢 SIGNAL"
                 elif score >= 2.0:
                     status = "🟡 NEAR MISS"

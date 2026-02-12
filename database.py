@@ -123,6 +123,12 @@ class DatabaseManager:
             )
         ''')
         
+        # FIX #16: Add indexes for frequently queried columns
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_trades_symbol_status ON trades(symbol, status)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_trades_portfolio ON trades(portfolio_id, status)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_signal_history_symbol ON signal_history(symbol, timestamp)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_trade_logs_trade ON trade_logs(trade_id, timestamp)')
+        
         conn.commit()
         # Only log if it's the first time we're initializing in this process
         if not _DB_INITIALIZED:

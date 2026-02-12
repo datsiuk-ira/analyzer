@@ -73,7 +73,7 @@ class MarketRegime:
         """Reduce position sizes by 50% automatically if risk_off."""
         return 0.5 if self.risk_off else 1.0
 
-    async def check_portfolio_correlation(self, new_symbol: str, current_positions: list) -> float:
+    async def check_portfolio_correlation(self, new_symbol: str, current_positions: list, fetcher: Optional[BinanceFetcher] = None) -> float:
         """
         Calculates correlation between a new asset and existing positions.
         Returns the maximum correlation found.
@@ -81,11 +81,13 @@ class MarketRegime:
         if not current_positions:
             return 0.0
         
-        fetcher = BinanceFetcher()
+        local_fetcher = fetcher is None
+        if local_fetcher:
+            fetcher = BinanceFetcher()
         try:
-            # Fetch last 24h data for new symbol (1h timeframe)
-            new_df = await fetcher.fetch_ohlcv(new_symbol, "1h", limit=24)
-            if new_df.empty or len(new_df) < 12:
+            # Fetch last 7 days of data for new symbol (1h timeframe = 168 candles)
+            new_df = await fetcher.fetch_ohlcv(new_symbol, "1h", limit=168)
+            if new_df.empty or len(new_df) < 48:
                 return 0.0
             
             new_returns = new_df['close'].pct_change().dropna()
@@ -95,8 +97,8 @@ class MarketRegime:
                 if pos_symbol == new_symbol:
                     continue
                 
-                pos_df = await fetcher.fetch_ohlcv(pos_symbol, "1h", limit=24)
-                if pos_df.empty or len(pos_df) < 12:
+                pos_df = await fetcher.fetch_ohlcv(pos_symbol, "1h", limit=168)
+                if pos_df.empty or len(pos_df) < 48:
                     continue
                 
                 pos_returns = pos_df['close'].pct_change().dropna()
@@ -111,4 +113,5 @@ class MarketRegime:
                 
             return max_corr
         finally:
-            await fetcher.close()
+            if local_fetcher:
+                await fetcher.close()

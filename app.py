@@ -4,6 +4,10 @@ import asyncio
 import time
 from datetime import datetime
 
+# FIX #10: Event loop handling
+import nest_asyncio
+nest_asyncio.apply()
+
 from config import settings
 from data_loader import BinanceFetcher, RealTimeDataStreamer
 from database import DatabaseManager
@@ -22,7 +26,19 @@ from views.validator import render_signal_validator
 from views.backtest import render_backtest_view
 
 def run_async(coro):
-    return asyncio.run(coro)
+    """FIX #10: Improved event loop handling"""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # If loop is already running (e.g., in Streamlit), use thread pool
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                future = pool.submit(asyncio.run, coro)
+                return future.result()
+        return loop.run_until_complete(coro)
+    except RuntimeError:
+        # Fallback to creating new loop
+        return asyncio.run(coro)
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_market_data(symbol, timeframe, htf):
@@ -44,6 +60,8 @@ def get_screen_results(timeframe, strat_settings):
     return results, datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 def change_symbol(new_symbol):
+    # ROUND 4 FIX: Normalize symbol (strip futures suffix)
+    new_symbol = new_symbol.replace(":USDT", "")
     if 'recent_symbols' not in st.session_state:
         st.session_state.recent_symbols = settings.symbols.copy()
     if new_symbol not in st.session_state.recent_symbols:
@@ -90,7 +108,7 @@ def init_session_state():
         st.session_state.fetcher = get_binance_fetcher()
         
     if 'reconciled' not in st.session_state:
-        st.session_state.pm.reconcile_offline_moves()
+        run_async(st.session_state.pm.reconcile_offline_moves())
         st.session_state.reconciled = True
     
     if 'regime' not in st.session_state:
@@ -118,6 +136,15 @@ def main():
     init_session_state()
 
     st.title(f"🚀 {settings.page_title}")
+
+    # ROUND 3.1 FIX: Handle pending navigation BEFORE pills widget renders
+    # (Streamlit forbids setting widget state after widget is instantiated)
+    if 'pending_nav' in st.session_state:
+        st.session_state.nav_page = st.session_state.pending_nav
+        del st.session_state.pending_nav
+        # ROUND 4 FIX: Force pills to re-read default by clearing its widget state
+        if 'nav_pills' in st.session_state:
+            del st.session_state.nav_pills
 
     # Top Navigation
     tabs = ["🚀 Dashboard", "📈 Coin View", "💼 Portfolios", "✅ Signal Validator", "🧪 Backtest"]
@@ -223,9 +250,14 @@ def main():
             execute_quick_sim
         )
     elif page == "📈 Coin View":
-        data_map = fetch_market_data(st.session_state.symbol, timeframe, htf)
+        # ROUND 3.1 FIX: Normalize symbol (strip futures suffix) and cache-bust on empty
+        view_symbol = st.session_state.symbol.replace(":USDT", "")
+        data_map = fetch_market_data(view_symbol, timeframe, htf)
+        if not data_map:
+            fetch_market_data.clear()
+            data_map = fetch_market_data(view_symbol, timeframe, htf)
         render_coin_view(
-            st.session_state.symbol, timeframe, htf, show_heikin, 
+            view_symbol, timeframe, htf, show_heikin, 
             strategy_type, risk_pct, rr_ratio, data_map, execute_quick_sim
         )
     elif page == "💼 Portfolios":
