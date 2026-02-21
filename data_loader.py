@@ -200,26 +200,54 @@ class BinanceFetcher(DataFetcher):
     async def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int = 1000, since: Optional[int] = None) -> pd.DataFrame:
         """
         Fetches OHLCV data from Binance Futures asynchronously with caching.
+        Supports limits > 1000 via paginated batch requests (Binance caps each call at 1000).
         """
+        # Normalize limit to a safe max
+        BATCH_SIZE = 1000  # Binance REST API hard cap per request
+
         cache_key = (symbol, timeframe, limit, since)
         now = time.time()
         
         if cache_key in self._ohlcv_cache:
             ts, df = self._ohlcv_cache[cache_key]
             if now - ts < self._cache_ttl:
-                # logger.debug(f"Cache Hit: {symbol} {timeframe}")
                 return df.copy()
 
         try:
-            ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit, since=since)
-            if not ohlcv:
+            all_ohlcv = []
+            remaining = limit
+            end_since = since  # will be populated as we page back
+
+            # Fetch backwards in time in BATCH_SIZE chunks until we have enough data
+            while remaining > 0:
+                batch_limit = min(remaining, BATCH_SIZE)
+                batch = await self.exchange.fetch_ohlcv(
+                    symbol, timeframe, limit=batch_limit, since=end_since
+                )
+                if not batch:
+                    break
+                all_ohlcv = batch + all_ohlcv  # prepend older data
+                remaining -= len(batch)
+                if len(batch) < batch_limit:
+                    break  # Exchange returned fewer than requested — we've hit the start of history
+                # Move end_since backwards by one batch duration for the next iteration
+                # batch[0][0] is the timestamp of the first candle in this batch (ms)
+                end_since = batch[0][0] - 1  # fetch older data before this batch
+                if remaining > 0:
+                    import asyncio as _asyncio
+                    await _asyncio.sleep(0.1)  # Respect rate limit between pages
+
+            if not all_ohlcv:
                 logger.warning(f"No data returned for {symbol} on {timeframe}")
                 return pd.DataFrame()
-                
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+
+            # Keep only the most recent `limit` candles (in case we over-fetched)
+            all_ohlcv = all_ohlcv[-limit:]
+
+            df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             
-            if len(ohlcv[0]) >= 11:
-                df['taker_buy_vol'] = [x[10] for x in ohlcv]
+            if len(all_ohlcv[0]) >= 11:
+                df['taker_buy_vol'] = [x[10] for x in all_ohlcv]
             else:
                 df['taker_buy_vol'] = None
                 
@@ -227,6 +255,8 @@ class BinanceFetcher(DataFetcher):
             
             cols = ['open', 'high', 'low', 'close', 'volume', 'taker_buy_vol']
             df[cols] = df[cols].apply(pd.to_numeric)
+            
+            logger.info(f"Fetched {len(df)} candles for {symbol} {timeframe} (requested {limit})")
             
             # Update Cache
             self._ohlcv_cache[cache_key] = (now, df)

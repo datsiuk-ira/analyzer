@@ -138,11 +138,13 @@ class PortfolioManager:
             portfolio_id = trade['portfolio_id']
             status = trade['status']
 
-            # Update current unrealized PnL in DB
+            # Update current unrealized PnL in DB (accounting for leverage)
+            lev = trade.get('leverage', self.LEVERAGE)
+            FEE_RATE = 0.0004  # 0.04% round-trip average
             if direction == 'BUY':
-                unrealized_pnl = (current_price - entry) * qty
+                unrealized_pnl = (current_price - entry) * qty * lev
             else:
-                unrealized_pnl = (entry - current_price) * qty
+                unrealized_pnl = (entry - current_price) * qty * lev
             
             # MAE/MFE Tracking
             max_drawdown_price = trade.get('max_drawdown_price')
@@ -194,11 +196,14 @@ class PortfolioManager:
                     pass
 
             if hit_sl:
-                # Calculate PnL: (exit - entry) * qty for LONG, (entry - exit) * qty for SHORT
+                # Calculate PnL with fee deduction
                 if direction == 'BUY':
-                    pnl = (exit_price - entry) * qty
+                    raw_pnl = (exit_price - entry) * qty
                 else: # SELL
-                    pnl = (entry - exit_price) * qty
+                    raw_pnl = (entry - exit_price) * qty
+                fee = (qty * exit_price + qty * entry) * FEE_RATE
+                pnl = raw_pnl - fee
+                logger.info(f"SL HIT: {symbol} | Raw PnL={raw_pnl:.2f}, Fee={fee:.2f}, Net PnL={pnl:.2f}")
                 
                 self._close_trade(trade_id, portfolio_id, exit_price, pnl, new_status, symbol=symbol)
                 continue
@@ -206,7 +211,10 @@ class PortfolioManager:
             if hit_tp and status == 'OPEN':
                 # TP1 Logic: Close 50%, Move SL to Breakeven
                 exit_price = tp
-                pnl_half = ((exit_price - entry) * (qty * 0.5)) if direction == 'BUY' else ((entry - exit_price) * (qty * 0.5))
+                raw_half = ((exit_price - entry) * (qty * 0.5)) if direction == 'BUY' else ((entry - exit_price) * (qty * 0.5))
+                fee_half = (qty * 0.5 * exit_price + qty * 0.5 * entry) * FEE_RATE
+                pnl_half = raw_half - fee_half
+                logger.info(f"TP1 HIT: {symbol} | Raw PnL={raw_half:.2f}, Fee={fee_half:.2f}, Net PnL={pnl_half:.2f}")
                 
                 # Get current position size to halve it
                 pos_size_half = trade['position_size_usdt'] * 0.5

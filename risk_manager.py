@@ -50,7 +50,7 @@ class RiskCalculator:
         # 1. Kelly Criterion Lite: adjusted_risk = base_risk * strength
         # Strength 1.0 = base risk, Strength 2.0 = 2x base risk
         # Apply Half-Kelly (0.5 multiplier) as per institutional standards
-        HALF_KELLY_MULT = 0.5
+        HALF_KELLY_MULT = 0.7  # Increased from 0.5 for larger positions
         adjusted_risk_pct = self.base_risk_pct * strength * HALF_KELLY_MULT
 
         # 2. Volatility Scaling: Reduce risk if ATR is high relative to price
@@ -67,8 +67,8 @@ class RiskCalculator:
             adjusted_risk_pct *= 0.5
             logger.debug(f"Efficiency Ratio {efficiency_ratio:.2f} < 0.3. Reducing position size by 50%.")
 
-        # Cap at 5% total account risk
-        adjusted_risk_pct = min(adjusted_risk_pct, 0.05)
+        # Cap at 8% total account risk (increased from 5%)
+        adjusted_risk_pct = min(adjusted_risk_pct, 0.08)
         
         risk_usdt = self.balance * adjusted_risk_pct
         price_risk = abs(entry_price - stop_loss)

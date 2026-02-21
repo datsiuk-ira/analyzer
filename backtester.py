@@ -1,16 +1,17 @@
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Any, Type
-from strategy import BaseStrategy, SignalType, Signal, Signal
+from strategy import BaseStrategy, SignalType, Signal
 from logger import logger
+
 
 class Backtester:
     """
-    Simple event-based backtester for validating strategies.
+    Event-based backtester for validating strategies.
     """
     def __init__(self, df: pd.DataFrame, strategy_class: Type[BaseStrategy], 
                  strat_settings: Dict[str, Any], initial_balance: float = 10000.0,
-                 risk_pct: float = 2.0, rr_ratio: float = 4.0):  # ROUND 6: Raised from 3.0 to 4.0
+                 risk_pct: float = 2.0, rr_ratio: float = 4.0):
         self.df = df
         self.strategy_class = strategy_class
         self.settings = strat_settings
@@ -21,245 +22,560 @@ class Backtester:
         
         self.trades = []
         self.equity_curve = []
+        self.active_trade = None
+        self.pending_order = None
+        self.consecutive_losses = 0
+
+        # Re-entry tracking
+        self.last_exit_reason = ''
+        self.last_exit_index = 0
+        self.last_exit_direction = ''
+        self.last_exit_half_risk = False
 
     def run(self):
-        logger.info(f"Starting backtest on {len(self.df)} candles...")
+        try:
+            self._run_logic()
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            logger.error(f"CRITICAL ERROR in Backtester: {e}")
+            return {}
+        
+        return self.get_metrics()
+
+    def _run_logic(self):
+        logger.info(f"Starting backtest on {len(self.df)} candles. Settings={self.settings}")
         
         # We need enough data for indicators
         warmup = 200
-        if len(self.df) <= warmup:
+        if len(self.df) <= warmup and not self.settings.get('test_mode'):
             return {"error": "Insufficient data for backtest"}
 
-        FEE_RATE = 0.0006 # 0.06% per execution
+        FEE_RATE = 0.0004  # 0.04% per side taker rate (Bug #18 fix)
         
-        # Simulate loop
-        active_trade = None
-        
-        # Pre-calculate indicators on the whole DF if possible, but strategy expects to do it
-        # Actually MarketAnalyzer does it. Let's pre-process.
+        # Pre-calculate indicators on the whole DF
         from analyzer import MarketAnalyzer
         from risk_manager import RiskCalculator
-        analyzer = MarketAnalyzer(self.df)
-        # ROUND 6 FIX 1: Correct setting keys (ema_fast/ema_slow, not ema_short/ema_long)
-        df = analyzer.calculate_indicators(
-            ema_fast=self.settings.get('ema_fast', self.settings.get('ema_short', 20)),
-            ema_slow=self.settings.get('ema_slow', self.settings.get('ema_long', 50)),
-            ema_trend=self.settings.get('ema_trend', 200),
-            rsi_period=self.settings.get('rsi_period', 14),
-            adx_period=self.settings.get('adx_period', 14),
-            use_cache=True
-        )
-        df = analyzer.detect_rsi_divergence()
-        df = analyzer.detect_patterns()
-        df = RiskCalculator.calculate_chandelier_exit(df)
         
-        # ROUND 6 FIX 3: Timeframe-adaptive cooldown
+        if not self.settings.get('test_mode'):
+            analyzer = MarketAnalyzer(self.df)
+            df = analyzer.calculate_indicators(
+                ema_fast=self.settings.get('ema_fast', self.settings.get('ema_short', 20)),
+                ema_slow=self.settings.get('ema_slow', self.settings.get('ema_long', 50)),
+                ema_trend=self.settings.get('ema_trend', 200),
+                rsi_period=self.settings.get('rsi_period', 14),
+                adx_period=self.settings.get('adx_period', 14),
+                use_cache=True
+            )
+            df = analyzer.detect_rsi_divergence()
+            df = analyzer.detect_patterns()
+            df = RiskCalculator.calculate_chandelier_exit(df)
+        else:
+            df = self.df  # Trust the passed DF in test mode
+        
+        # Timeframe-adaptive cooldown
         if len(df) >= 2:
             td = (df['timestamp'].iloc[1] - df['timestamp'].iloc[0]).total_seconds() / 60
             tf_minutes = max(1, int(round(td)))
         else:
             tf_minutes = 1
-        # ROUND 7: Relaxed cooldown to 15m (was 60m) to catch sequential trend legs
-        cooldown_candles = max(5, 15 // tf_minutes)
+        # Reduced cooldown: 1-bar for 1m so we don't miss signals back-to-back
+        cooldown_candles = max(1, 2 // tf_minutes)
         cooldown_until = 0
         
-        # ROUND 6 FIX 5: Synthesize HTF data for MTF filter
-        htf_df = df.set_index('timestamp').resample('15min').agg({
-            'open': 'first', 'high': 'max', 'low': 'min',
-            'close': 'last', 'volume': 'sum'
-        }).dropna().reset_index()
-        if len(htf_df) > 50:
-            htf_analyzer = MarketAnalyzer(htf_df)
-            htf_df = htf_analyzer.calculate_indicators(
-                ema_fast=self.settings.get('ema_fast', 20),
-                ema_slow=self.settings.get('ema_slow', 50),
-                ema_trend=self.settings.get('ema_trend', 200),
-                use_cache=False
-            )
-        else:
+        # Synthesize HTF data for MTF filter
+        htf_df = None
+        try:
+            htf_df = df.set_index('timestamp').resample('15min').agg({
+                'open': lambda x: x.iloc[0] if len(x) > 0 else float('nan'),
+                'high': 'max', 
+                'low': 'min',
+                'close': lambda x: x.iloc[-1] if len(x) > 0 else float('nan'),
+                'volume': 'sum'
+            }).dropna().reset_index()
+            if len(htf_df) <= 50:
+                htf_df = None
+        except Exception as e:
+            logger.debug(f"HTF synthesis failed: {e}")
             htf_df = None
         
-        # ROUND 6 FIX 4: Track last loss direction for anti-whipsaw
-        last_loss_direction = None
+        # Track last loss direction (removed anti-whipsaw — was blocking valid re-entries)
 
-        for i in range(warmup, len(df)):
+        start_index = warmup if not self.settings.get('test_mode') else 1
+        for i in range(start_index, len(df)):
             current_row = df.iloc[i]
             timestamp = current_row['timestamp']
             price = current_row['close']
             
+            # ═══════════════════════════════════════════════
+            # 0. Check Pending Order Fill
+            # ═══════════════════════════════════════════════
+            if self.pending_order:
+                time_since_creation = i - self.pending_order['created_at_index']
+                
+                # Pending Modification: After 3 candles, move to EMA_20
+                if time_since_creation > 3 and not self.pending_order.get('modified', False):
+                    new_limit = current_row.get('EMA_FAST')
+                    if new_limit and not pd.isna(new_limit):
+                        self.pending_order['limit_price'] = new_limit
+                        self.pending_order['modified'] = True
+                        logger.debug(f"[PENDING] Modified limit to EMA_20={new_limit:.4f} at candle {i}")
+
+                # Expiry: 10 candles
+                if time_since_creation > 10:
+                    logger.debug(f"[PENDING] Expired at candle {i} (age={time_since_creation})")
+                    self.pending_order = None
+                
+                else:
+                    filled = False
+                    fill_price = 0
+                    
+                    if self.pending_order['direction'] == 'BUY':
+                        if current_row['low'] <= self.pending_order['limit_price']:
+                            filled = True
+                            # Gap Fill: If Open < Limit, get better price at Open
+                            fill_price = min(current_row['open'], self.pending_order['limit_price'])
+                    else:  # SELL
+                        if current_row['high'] >= self.pending_order['limit_price']:
+                            filled = True
+                            fill_price = max(current_row['open'], self.pending_order['limit_price'])
+                    
+                    if filled:
+                        sl_dist = self.pending_order['sl_dist']
+                        tp_dist = self.pending_order['tp_dist']
+                        
+                        if self.pending_order['direction'] == 'BUY':
+                            sl = fill_price - sl_dist
+                            tp = fill_price + tp_dist
+                            liq_price = fill_price * (1 - (0.8 / self.pending_order['leverage']))
+                        else:
+                            sl = fill_price + sl_dist
+                            tp = fill_price - tp_dist
+                            liq_price = fill_price * (1 + (0.8 / self.pending_order['leverage']))
+                        
+                        entry_fee = (self.pending_order['qty'] * fill_price) * FEE_RATE
+                        _sig = self.pending_order.get('signal')
+                        self.active_trade = {
+                            'symbol': 'BACKTEST',
+                            'direction': self.pending_order['direction'],
+                            'entry': fill_price,
+                            'qty': self.pending_order['qty'],
+                            'original_qty': self.pending_order['qty'],
+                            'sl': sl, 'tp': tp, 'liq_price': liq_price,
+                            'entry_index': i,
+                            'entry_time': timestamp,
+                            'entry_fee': entry_fee,
+                            'partial_tp_hit': False,
+                            # Partial TP at 0.8R — locks profit early before SL hits
+                            'partial_tp_price': fill_price + (0.8 * sl_dist) if self.pending_order['direction'] == 'BUY' else fill_price - (0.8 * sl_dist),
+                            'leverage': self.pending_order['leverage'],
+                            'atr': self.pending_order['atr'],
+                            'avg_entry': fill_price,
+                            'pyramided': False,
+                            # ── Why this trade was selected ──
+                            'signal_reason': _sig.reason if _sig else '',
+                            'score_breakdown': (_sig.score_breakdown or {}) if _sig else {},
+                            'signal_score': round(getattr(_sig, 'strength', 1.0) * 4.0, 1) if _sig else 0.0,
+                            'strategy_name': _sig.strategy_name if _sig else '',
+                        }
+                        self.balance -= entry_fee
+                        self.pending_order = None
+                        logger.debug(f"[FILL] Pending filled at {fill_price:.4f}, SL={sl:.4f}, TP={tp:.4f}")
+
+            
+            # ═══════════════════════════════════════════════
             # 1. Manage Active Trade
-            if active_trade:
+            # ═══════════════════════════════════════════════
+            if self.active_trade:
+                trade = self.active_trade
                 hit_sl = False
                 hit_tp = False
-                hit_trailing = False
+                hit_liq = False
+                hit_stagnation = False
+                hit_climax = False
                 exit_price = 0
                 
-                # ROUND 3.1 FIX: Check SL/TP FIRST, then trailing stop only after profit threshold
-                # A5 FIX: When both SL and TP hit same candle, use distance from open as proxy
+                # Calculate current R-multiple
+                risk_amt = abs(trade['entry'] - trade['sl']) * trade['qty']
+                if trade['direction'] == 'BUY':
+                    open_pnl = (current_row['close'] - trade['entry']) * trade['qty']
+                else:
+                    open_pnl = (trade['entry'] - current_row['close']) * trade['qty']
                 
-                if active_trade['direction'] == 'BUY':
-                    sl_hit = current_row['low'] <= active_trade['sl']
-                    tp_hit = current_row['high'] >= active_trade['tp']
-                    
-                    if sl_hit and tp_hit:
-                        # Both hit same candle — closest to open wins
-                        if abs(current_row['open'] - active_trade['sl']) < abs(current_row['open'] - active_trade['tp']):
-                            # SL closer to open → hit first
-                            hit_sl = True
-                            exit_price = active_trade['sl']
-                        else:
-                            # TP closer to open → hit first
-                            hit_tp = True
-                            exit_price = active_trade['tp']
-                    elif sl_hit:
-                        hit_sl = True
-                        exit_price = active_trade['sl']
-                    elif tp_hit:
-                        hit_tp = True
-                        exit_price = active_trade['tp']
-                    # ROUND 7: Trailing stop activates at 1.5R profit to let winners run
-                    elif not hit_sl and not hit_tp:
-                        atr = active_trade.get('atr', 0)
-                        entry_price = active_trade['entry']
-                        # Activation threshold: Entry + 1.5 * ATR (or min 0.2% price if ATR is tiny)
-                        activation_dist = max(atr * 1.5, entry_price * 0.002)
-                        profit_threshold = entry_price + activation_dist
-                        
-                        if current_row['high'] >= profit_threshold:
-                            trailing_stop = current_row.get('chandelier_long')
-                            # Ensure exit locks in at least 1R profit
-                            min_profit_exit = entry_price + atr
-                            if trailing_stop and trailing_stop > min_profit_exit and current_row['low'] <= trailing_stop:
-                                hit_trailing = True
-                                exit_price = trailing_stop
-                else:  # SELL
-                    sl_hit = current_row['high'] >= active_trade['sl']
-                    tp_hit = current_row['low'] <= active_trade['tp']
-                    
-                    if sl_hit and tp_hit:
-                        # Both hit same candle — closest to open wins
-                        if abs(current_row['open'] - active_trade['sl']) < abs(current_row['open'] - active_trade['tp']):
-                            # SL closer to open → hit first
-                            hit_sl = True
-                            exit_price = active_trade['sl']
-                        else:
-                            # TP closer to open → hit first
-                            hit_tp = True
-                            exit_price = active_trade['tp']
-                    elif sl_hit:
-                        hit_sl = True
-                        exit_price = active_trade['sl']
-                    elif tp_hit:
-                        hit_tp = True
-                        exit_price = active_trade['tp']
-                    # ROUND 7: Trailing stop activates at 1.5R profit to let winners run
-                    elif not hit_sl and not hit_tp:
-                        atr = active_trade.get('atr', 0)
-                        entry_price = active_trade['entry']
-                        # Activation threshold: Entry - 1.5 * ATR (or min 0.2% price if ATR is tiny)
-                        activation_dist = max(atr * 1.5, entry_price * 0.002)
-                        profit_threshold = entry_price - activation_dist
-                        
-                        if current_row['low'] <= profit_threshold:
-                            trailing_stop = current_row.get('chandelier_short')
-                            # Ensure exit locks in at least 1R profit
-                            min_profit_exit = entry_price - atr
-                            if trailing_stop and trailing_stop < min_profit_exit and current_row['high'] >= trailing_stop:
-                                hit_trailing = True
-                                exit_price = trailing_stop
+                current_r = open_pnl / risk_amt if risk_amt > 0 else 0
+                
+                # ─── Time-Based Stagnation Exit ───
+                # If duration >= 40 candles and PnL < 1.0R, force exit
+                entry_idx_val = trade.get('entry_index', i)
+                duration = i - entry_idx_val
+                if duration >= 40 and current_r < 1.0:
+                    hit_stagnation = True
+                    logger.debug(f"[EXIT] Stagnation at candle {i}, duration={duration}, R={current_r:.2f}")
 
-                if hit_sl or hit_tp or hit_trailing:
-                    # Fee deduction for Exit
-                    exit_fee = (active_trade['qty'] * exit_price) * FEE_RATE
+                # ─── Volume-Climax Exit ───
+                # Vol > 3*Avg AND Adverse Move > 0.5*ATR
+                vol_ma_val = self.df['volume'].rolling(20).mean().iloc[i] if i >= 20 else self.df['volume'].iloc[:i+1].mean()
+                if current_row['volume'] > 3 * vol_ma_val:
+                    atr = trade.get('atr', price * 0.01)
+                    # Bug #14 fix: widen threshold from 0.5×ATR to 1.0×ATR (was triggering on normal vol)
+                    if trade['direction'] == 'BUY':
+                        if current_row['close'] < trade['entry'] - (1.0 * atr):
+                            hit_climax = True
+                            logger.debug(f"[EXIT] Volume Climax (BUY adverse) at candle {i}")
+                    else:
+                        if current_row['close'] > trade['entry'] + (1.0 * atr):
+                            hit_climax = True
+                            logger.debug(f"[EXIT] Volume Climax (SELL adverse) at candle {i}")
+                
+                # ─── Dynamic Pyramiding ───
+                # Trigger at 1.5R (raised from 0.8R — must be truly profitable first)
+                pyramid_trigger_r = 1.5
+                
+                if current_r > pyramid_trigger_r and not trade.get('pyramided', False):
+                    # Bug #10 fix: 5% not 15%; Bug #19 fix: use FEE_RATE not hardcoded 0.01%
+                    add_qty_size = (self.balance * 0.05 * trade['leverage']) / current_row['close']
+                    new_total_qty = trade['qty'] + add_qty_size
                     
-                    pnl = (exit_price - active_trade['entry']) * active_trade['qty'] if active_trade['direction'] == 'BUY' else (active_trade['entry'] - exit_price) * active_trade['qty']
-                    pnl -= (active_trade['entry_fee'] + exit_fee)
+                    # Weighted avg entry
+                    old_cost = trade['qty'] * trade['avg_entry']
+                    new_cost = add_qty_size * current_row['close']
+                    new_avg = (old_cost + new_cost) / new_total_qty
+                    
+                    trade['qty'] = new_total_qty
+                    trade['avg_entry'] = new_avg
+                    trade['pyramided'] = True
+                    
+                    pyramid_fee = (add_qty_size * current_row['close']) * FEE_RATE
+                    self.balance -= pyramid_fee
+                    trade['entry_fee'] += pyramid_fee
+                    
+                    # Bug #7 fix: do NOT move SL to avg_entry — preserve the trailing SL
+                    # Only ensure SL is at least at breakeven (avg_entry)
+                    if trade['direction'] == 'BUY':
+                        trade['sl'] = max(trade['sl'], new_avg)
+                        trade['liq_price'] = new_avg * (1 - (0.8 / trade['leverage']))
+                    else:
+                        trade['sl'] = min(trade['sl'], new_avg)
+                        trade['liq_price'] = new_avg * (1 + (0.8 / trade['leverage']))
+                    
+                    self.trades.append({
+                        'symbol': 'BACKTEST', 'direction': trade['direction'],
+                        'entry': current_row['close'], 'qty': add_qty_size,
+                        'exit_price': 0, 'result': 'PYRAMID_ENTRY', 
+                        'entry_time': timestamp, 'exit_time': timestamp, 
+                        'pnl': 0, 'fees': pyramid_fee,
+                        'leverage': trade['leverage']
+                    })
+                    logger.debug(f"[PYRAMID] Added {add_qty_size:.6f} qty at {current_row['close']:.4f}, new avg={new_avg:.4f}")
+
+                # ─── Trailing Stop (2.0 ATR, activates at 0.7R) ───
+                atr_val = trade.get('atr', price * 0.01)
+                # Trail dist 1.0 ATR — proportional to tighter SL
+                trail_dist = 1.0 * atr_val
+                
+                if current_r > 1.0:  # Activate at 1.0R (break-even territory)
+                    if trade['direction'] == 'BUY':
+                        new_sl = current_row['close'] - trail_dist
+                        if new_sl > trade['sl']:
+                            trade['sl'] = new_sl
+                            logger.debug(f"[TRAIL] BUY SL moved up to {new_sl:.4f} at candle {i}")
+                    else:
+                        new_sl = current_row['close'] + trail_dist
+                        if new_sl < trade['sl']:
+                            trade['sl'] = new_sl
+                            logger.debug(f"[TRAIL] SELL SL moved down to {new_sl:.4f} at candle {i}")
+
+                # ═══════════════════════════════════════════════
+                # Check Exits (SINGLE block — no duplicates)
+                # ═══════════════════════════════════════════════
+                if trade['direction'] == 'BUY':
+                    # Priority: Liquidation > SL > TP > Partial TP
+                    if current_row['low'] <= trade.get('liq_price', 0):
+                        hit_liq = True
+                        exit_price = trade['liq_price']
+                    elif current_row['low'] <= trade['sl']:
+                        hit_sl = True
+                        exit_price = trade['sl']
+                    elif current_row['high'] >= trade['tp']:
+                        hit_tp = True
+                        exit_price = trade['tp']
+                    elif not trade.get('partial_tp_hit') and current_row['high'] >= trade.get('partial_tp_price', 999999):
+                        # Partial TP: close 70% at 0.8R (locks most profit), move SL to just above breakeven
+                        trade['partial_tp_hit'] = True
+                        trade['sl'] = trade['avg_entry'] * 1.0005  # tight BE buffer 0.05%
+                        
+                        close_ratio = 0.70  # Close 70% — book profit aggressively
+                        partial_qty = trade['qty'] * close_ratio
+                        trade['qty'] -= partial_qty
+                        
+                        partial_exit_price = trade['partial_tp_price']
+                        partial_fee = (partial_qty * partial_exit_price) * FEE_RATE
+                        # qty = risk/SL_dist already encodes leverage — do NOT multiply again
+                        partial_pnl = (partial_exit_price - trade['avg_entry']) * partial_qty - partial_fee
+                        self.balance += partial_pnl
+                        self.trades.append({
+                            'symbol': 'BACKTEST', 'direction': 'BUY', 'entry': trade['avg_entry'],
+                            'exit_price': partial_exit_price, 'entry_time': trade['entry_time'],
+                            'exit_time': timestamp, 'result': 'Partial TP', 'pnl': partial_pnl,
+                            'qty': partial_qty, 'fees': partial_fee,
+                            'leverage': trade['leverage']
+                        })
+                        logger.debug(f"[PARTIAL_TP] BUY closed {close_ratio*100:.0f}% at {partial_exit_price:.4f}, PnL={partial_pnl:.2f}")
+
+                else:  # SELL
+                    if current_row['high'] >= trade.get('liq_price', 999999):
+                        hit_liq = True
+                        exit_price = trade['liq_price']
+                    elif current_row['high'] >= trade['sl']:
+                        hit_sl = True
+                        exit_price = trade['sl']
+                    elif current_row['low'] <= trade['tp']:
+                        hit_tp = True
+                        exit_price = trade['tp']
+                    elif not trade.get('partial_tp_hit') and current_row['low'] <= trade.get('partial_tp_price', 0):
+                        # SELL partial TP: close 70% at 0.8R, move SL to just below breakeven
+                        trade['partial_tp_hit'] = True
+                        trade['sl'] = trade['avg_entry'] * 0.9995  # tight BE buffer 0.05%
+                        
+                        close_ratio = 0.70  # Close 70% — book profit aggressively
+                        partial_qty = trade['qty'] * close_ratio
+                        trade['qty'] -= partial_qty
+                        
+                        partial_exit_price = trade['partial_tp_price']
+                        partial_fee = (partial_qty * partial_exit_price) * FEE_RATE
+                        # qty encodes leverage — do NOT multiply again
+                        partial_pnl = (trade['avg_entry'] - partial_exit_price) * partial_qty - partial_fee
+                        self.balance += partial_pnl
+                        self.trades.append({
+                            'symbol': 'BACKTEST', 'direction': 'SELL', 'entry': trade['avg_entry'],
+                            'exit_price': partial_exit_price, 'entry_time': trade['entry_time'],
+                            'exit_time': timestamp, 'result': 'Partial TP', 'pnl': partial_pnl,
+                            'qty': partial_qty, 'fees': partial_fee,
+                            'leverage': trade['leverage']
+                        })
+                        logger.debug(f"[PARTIAL_TP] SELL closed {close_ratio*100:.0f}% at {partial_exit_price:.4f}, PnL={partial_pnl:.2f}")
+
+                # ─── Stagnation / Climax exit price (applies to BOTH directions) ───
+                if (hit_stagnation or hit_climax) and exit_price == 0:
+                    exit_price = current_row['close']
+
+                # ─── Close Trade ───
+                if hit_sl or hit_tp or hit_liq or hit_stagnation or hit_climax:
+                    exit_fee = (trade['qty'] * exit_price) * FEE_RATE
+                    
+                    qty = trade['qty']
+                    if trade['direction'] == 'BUY':
+                        # qty = risk/SL_dist encodes leverage — plain price diff × qty is correct
+                        pnl = (exit_price - trade['entry']) * qty
+                    else:
+                        pnl = (trade['entry'] - exit_price) * qty
+                    pnl -= exit_fee  # Entry fee already deducted from balance
+                    
+                    # Hard floor: balance cannot go negative (margin call)
+                    if self.balance + pnl < 0:
+                        pnl = -self.balance * 0.95  # Lose max 95% (keep tiny residual)
                     
                     self.balance += pnl
-                    active_trade['exit_time'] = timestamp
-                    active_trade['exit_price'] = exit_price
-                    active_trade['pnl'] = pnl
-                    active_trade['result'] = 'SL' if hit_sl else ('TP' if hit_tp else 'Trailing Stop')
-                    active_trade['fees'] = active_trade['entry_fee'] + exit_fee
                     
-                    self.trades.append(active_trade)
-                    # ROUND 6 FIX 3 & 4: Cooldown after ANY exit + track loss direction
-                    cooldown_until = i + cooldown_candles
+                    # Determine result string
+                    if hit_liq:
+                        result_str = 'LIQUIDATION'
+                    elif hit_sl:
+                        result_str = 'SL'
+                    elif hit_tp:
+                        result_str = 'TP'
+                    elif hit_stagnation:
+                        result_str = 'Stagnation'
+                    elif hit_climax:
+                        result_str = 'Volume Climax'
+                    else:
+                        result_str = 'Unknown'
+                    
+                    total_fees = trade['entry_fee'] + exit_fee
+                    
+                    trade['exit_time'] = timestamp
+                    trade['exit_price'] = exit_price
+                    trade['pnl'] = pnl
+                    trade['result'] = result_str
+                    trade['fees'] = total_fees
+                    
+                    # Track consecutive losses
                     if pnl < 0:
-                        last_loss_direction = active_trade['direction']
-                    active_trade = None
+                        self.consecutive_losses += 1
+                    else:
+                        self.consecutive_losses = 0
+                    
+                    self.trades.append(trade)
+                    cooldown_until = i + cooldown_candles
+                    
+                    # Store exit context for re-entry bypass
+                    self.last_exit_reason = result_str
+                    self.last_exit_index = i
+                    self.last_exit_direction = trade['direction']
+                    self.last_exit_half_risk = trade.get('half_risk_triggered', False)
+                    
+                    self.active_trade = None
+                    logger.debug(f"[CLOSE] {result_str} at {exit_price:.4f}, PnL={pnl:.2f}, Balance={self.balance:.2f}")
+            
+            # ═══════════════════════════════════════════════
+            # 2. Signal Generation (only if no active trade AND no pending order)
+            # ═══════════════════════════════════════════════
+            
+            # Aggressive Re-entry: bypass cooldown after Stagnation
+            can_bypass_cooldown = False
+            if self.last_exit_reason == 'Stagnation':
+                can_bypass_cooldown = True
+            if self.last_exit_half_risk and self.last_exit_reason == 'SL':
+                can_bypass_cooldown = True
 
-            # 2. Check for New Signal (only if no active trade and not in cooldown)
-            if not active_trade and i >= cooldown_until:
-                # FIX #8: Reuse strategy instance, just update the DataFrame reference
-                if i == warmup:
-                    # Create strategy instance only once at the start
+            # Only bypass if within 10 candles of exit
+            if can_bypass_cooldown and (i - self.last_exit_index <= 10):
+                pass  # Allow through
+            else:
+                if i < cooldown_until:
+                    self.equity_curve.append({'timestamp': timestamp, 'balance': self.balance})
+                    continue
+
+            # Hard stop: never enter new trades on a blown account
+            if self.balance <= 0:
+                self.equity_curve.append({'timestamp': timestamp, 'balance': self.balance})
+                continue
+
+            if not self.active_trade and not self.pending_order:
+                if i == start_index:
                     sub_df = df.iloc[:i+1]
                     htf_sub = htf_df.iloc[:len(htf_df)] if htf_df is not None else None
                     strategy = self.strategy_class(sub_df, htf_sub, self.settings)
                 else:
-                    # Update the DataFrame reference instead of creating new object
                     strategy.df = df.iloc[:i+1]
                     if htf_df is not None:
                         strategy.htf_df = htf_df.iloc[:len(htf_df)]
                 
-                # generate_signal(index=-1) because we already sliced it
                 signal = strategy.generate_signal(index=-1)
                 
-                # ROUND 6 FIX 4: Anti-whipsaw - block opposite direction after loss
-                if last_loss_direction is not None:
-                    if (last_loss_direction == 'BUY' and signal.type == SignalType.SELL) or \
-                       (last_loss_direction == 'SELL' and signal.type == SignalType.BUY):
-                        signal = Signal(SignalType.NEUTRAL, f"Blocked opposite direction after {last_loss_direction} loss", strategy.strategy_name)
-                        last_loss_direction = None  # Reset after blocking once
+                # REMOVED: Anti-whipsaw filter (was blocking valid re-entries)
                 
                 if signal.type != SignalType.NEUTRAL:
-                    # Calculate SL/TP
-                    atr = current_row.get('ATR', price * 0.02)
-                    # ROUND 6 FIX 6: SL floor to prevent too-tight stops on low TF
-                    risk_val = max(atr * 2.0, price * 0.003)  # Min 0.3% SL
+                    # Circuit Breaker: 3 consecutive losses -> 60m cooldown
+                    if self.consecutive_losses >= 3:
+                        cooldown_until = i + (30 // tf_minutes)  # 30min cooldown (was 60min — too aggressive)
+                        self.consecutive_losses = 0
+                        logger.info(f"[CIRCUIT_BREAKER] 3 consecutive losses, 30m cooldown from candle {i}")
+                        self.equity_curve.append({'timestamp': timestamp, 'balance': self.balance})
+                        continue
+
+                    # ─── VAL (Volatility-Adjusted Leverage) ───
+                    atr_val = getattr(signal, 'atr', price * 0.01)
+                    # 1.0 ATR SL: tight enough to enable high leverage, wide enough for micro noise
+                    min_sl_dist = 1.0 * atr_val
+                    min_sl_pct = min_sl_dist / price
                     
-                    if signal.type == SignalType.BUY:
-                        sl = price - risk_val
-                        # ROUND 5 FIX: Use full RR ratio (cap was limiting upside)
-                        tp = price + (risk_val * self.rr_ratio)
+                    # Risk 5% of balance per trade (scalping high-leverage: smaller risk per trade)
+                    target_risk_pct = 0.05
+                    current_leverage = target_risk_pct / min_sl_pct if min_sl_pct > 0 else 1.0
+                    
+                    # Dynamic leverage cap: 50x-125x based on signal strength
+                    # signal.strength = score/4.0, so score=4.5→strength≈1.125, score=6.0→strength=1.5
+                    signal_score = getattr(signal, 'strength', 1.0) * 4.0
+                    if signal_score >= 6.0:
+                        max_leverage = 125.0  # Very strong signal
+                    elif signal_score >= 5.5:
+                        max_leverage = 100.0
+                    elif signal_score >= 5.0:
+                        max_leverage = 75.0
                     else:
-                        sl = price + risk_val
-                        tp = price - (risk_val * self.rr_ratio)
+                        max_leverage = 50.0   # Minimum for scalping
+                    current_leverage = max(3.0, min(current_leverage, max_leverage))
+                    current_leverage = round(current_leverage, 1)
+                    
+                    # Bug #2 fix: correct risk-based position sizing
+                    # qty × SL_distance = risk_amount → qty = risk_amount / SL_distance
+                    risk_amount = self.balance * target_risk_pct
+                    sl_distance = price * min_sl_pct
+                    qty = risk_amount / sl_distance if sl_distance > 0 else 0
+                    position_value = qty * price
+                    
+                    sl_dist_pct = min_sl_pct
+                    
+                    target_rr = getattr(signal, 'dynamic_rr', 1.5)  # Default 1.5R — actually achievable on 1m
+                    tp_dist_pct = sl_dist_pct * target_rr
+
+                    # ─── Entry Logic ───
+                    adx_val = getattr(signal, 'adx', 0)
+                    atr_val = getattr(signal, 'atr', price * 0.01)
+                    
+                    # Aggressive Market Entry (Strong Trend, ADX > 30)
+                    if adx_val > 30:
+                        if signal.type == SignalType.BUY:
+                            sl = price - (price * sl_dist_pct)
+                            tp = price + (price * tp_dist_pct)
+                            liq_price = price * (1 - (0.8 / current_leverage))
+                        else:
+                            sl = price + (price * sl_dist_pct)
+                            tp = price - (price * tp_dist_pct)
+                            liq_price = price * (1 + (0.8 / current_leverage))
                         
-                    # ROUND 5 FIX: Half-Kelly sizing (matches live risk_manager)
-                    HALF_KELLY = 0.5
-                    risk_amount = self.balance * (self.risk_pct / 100) * HALF_KELLY
-                    price_risk = abs(price - sl)
-                    qty = risk_amount / price_risk if price_risk > 0 else 0
-                    
-                    # ROUND 5 FIX: Max position cap (20% of balance)
-                    max_position = self.balance * 0.20
-                    if qty * price > max_position:
-                        qty = max_position / price
-                    
-                    if qty > 0:
                         entry_fee = (qty * price) * FEE_RATE
-                        active_trade = {
-                            'symbol': 'BACKTEST',
-                            'direction': 'BUY' if signal.type == SignalType.BUY else 'SELL',
-                            'entry': price,
+                        self.active_trade = {
+                            'symbol': 'BACKTEST', 'direction': signal.type.value,
+                            'entry': price, 'qty': qty,
+                            'original_qty': qty,
+                            'entry_index': i,
+                            'sl': sl, 'tp': tp, 'liq_price': liq_price,
                             'entry_time': timestamp,
                             'entry_fee': entry_fee,
-                            'sl': sl,
-                            'tp': tp,
-                            'qty': qty,
-                            'risk': risk_amount,
-                            'atr': atr,  # ROUND 3.1: Store ATR for trailing stop profit threshold
-                            'signal_reason': signal.reason if hasattr(signal, 'reason') else ''
+                            'partial_tp_hit': False,
+                            # Partial TP at 0.8R — locks profit before SL can be hit on most moves
+                            'partial_tp_price': price + (0.8 * (price * sl_dist_pct)) if signal.type == SignalType.BUY else price - (0.8 * (price * sl_dist_pct)),
+                            'leverage': current_leverage,
+                            'atr': atr_val,
+                            'avg_entry': price,
+                            'pyramided': False,
+                            # ── Why this trade was selected ──
+                            'signal_reason': signal.reason,
+                            'score_breakdown': signal.score_breakdown or {},
+                            'signal_score': round(getattr(signal, 'strength', 1.0) * 4.0, 1),
+                            'strategy_name': signal.strategy_name,
                         }
-            
+                        self.balance -= entry_fee
+                        logger.info(f"[ENTRY] Aggressive Market {signal.type.value} at {price:.4f}, Lev={current_leverage}x, SL={sl:.4f}, TP={tp:.4f}")
+                        self.equity_curve.append({'timestamp': timestamp, 'balance': self.balance})
+                        continue
+
+                    # Limit Logic with Dynamic Offset
+                    limit_offset = 0.0
+                    if adx_val > 25:
+                        limit_offset = 0.0
+                    else:
+                        limit_offset = atr_val * 0.20
+
+                    if signal.type == SignalType.BUY:
+                        limit_price = price - limit_offset
+                    else:
+                        limit_price = price + limit_offset
+
+                    self.pending_order = {
+                        'type': signal.type,
+                        'direction': signal.type.value,
+                        'limit_price': limit_price,
+                        'sl': limit_price - (price * sl_dist_pct) if signal.type == SignalType.BUY else limit_price + (price * sl_dist_pct),
+                        'tp': limit_price + (price * tp_dist_pct) if signal.type == SignalType.BUY else limit_price - (price * tp_dist_pct),
+                        'created_at': timestamp,
+                        'created_at_index': i,
+                        'signal': signal,
+                        'leverage': current_leverage,
+                        'qty': qty,
+                        'atr': atr_val,
+                        'sl_dist': (price * sl_dist_pct),
+                        'tp_dist': (price * tp_dist_pct)
+                    }
+                    logger.debug(f"[PENDING] {signal.type.value} created at {limit_price:.4f} (offset={limit_offset:.4f})")
+
             self.equity_curve.append({'timestamp': timestamp, 'balance': self.balance})
 
         return self.get_metrics()
 
     def get_metrics(self) -> Dict[str, Any]:
-        # ROUND 3: Expanded from 5 to 17+ metrics
         if not self.trades:
             return {
                 "Start Balance": round(self.initial_balance, 2),
@@ -274,6 +590,10 @@ class Backtester:
                 "TP Hits": 0,
                 "SL Hits": 0,
                 "Trailing Stop Hits": 0,
+                "Partial TP Hits": 0,
+                "Stagnation Exits": 0,
+                "Volume Climax Exits": 0,
+                "Pyramid Entries": 0,
                 "Avg Win": 0,
                 "Avg Loss": 0,
                 "Max Win": 0,
@@ -286,10 +606,14 @@ class Backtester:
             }
             
         df_trades = pd.DataFrame(self.trades)
-        wins = df_trades[df_trades['pnl'] > 0]
-        losses = df_trades[df_trades['pnl'] <= 0]
         
-        win_rate = len(wins) / len(df_trades) * 100 if len(df_trades) > 0 else 0
+        # Filter out PYRAMID_ENTRY for win/loss stats
+        real_trades = df_trades[df_trades['result'] != 'PYRAMID_ENTRY']
+        
+        wins = real_trades[real_trades['pnl'] > 0]
+        losses = real_trades[real_trades['pnl'] <= 0]
+        
+        win_rate = len(wins) / len(real_trades) * 100 if len(real_trades) > 0 else 0
         gross_profit = wins['pnl'].sum()
         gross_loss = abs(losses['pnl'].sum())
         profit_factor = gross_profit / gross_loss if gross_loss > 0 else gross_profit
@@ -301,6 +625,10 @@ class Backtester:
         tp_hits = len(df_trades[df_trades['result'] == 'TP'])
         sl_hits = len(df_trades[df_trades['result'] == 'SL'])
         trailing_hits = len(df_trades[df_trades['result'] == 'Trailing Stop'])
+        partial_tp_hits = len(df_trades[df_trades['result'] == 'Partial TP'])
+        stagnation_exits = len(df_trades[df_trades['result'] == 'Stagnation'])
+        climax_exits = len(df_trades[df_trades['result'] == 'Volume Climax'])
+        pyramid_entries = len(df_trades[df_trades['result'] == 'PYRAMID_ENTRY'])
         
         # Win/Loss stats
         avg_win = wins['pnl'].mean() if len(wins) > 0 else 0
@@ -325,8 +653,8 @@ class Backtester:
             max_balance = self.balance
         
         # Sharpe Ratio (annualized, assuming 365 trading days)
-        if len(df_trades) > 1:
-            returns = df_trades['pnl'] / self.initial_balance
+        if len(real_trades) > 1:
+            returns = real_trades['pnl'] / self.initial_balance
             sharpe = (returns.mean() / returns.std()) * np.sqrt(365) if returns.std() > 0 else 0
         else:
             sharpe = 0
@@ -340,10 +668,14 @@ class Backtester:
             "Total Net PnL %": round(total_net_pnl_pct, 2),
             "Win Rate": round(win_rate, 2),
             "Profit Factor": round(profit_factor, 2),
-            "Total Trades": len(df_trades),
+            "Total Trades": len(real_trades),
             "TP Hits": tp_hits,
             "SL Hits": sl_hits,
             "Trailing Stop Hits": trailing_hits,
+            "Partial TP Hits": partial_tp_hits,
+            "Stagnation Exits": stagnation_exits,
+            "Volume Climax Exits": climax_exits,
+            "Pyramid Entries": pyramid_entries,
             "Avg Win": round(avg_win, 2),
             "Avg Loss": round(avg_loss, 2),
             "Max Win": round(max_win, 2),

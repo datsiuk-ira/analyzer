@@ -29,6 +29,15 @@ import warnings
 warnings.filterwarnings('ignore')
 
 
+# Module-level cache: keyed by (n_candles // 50) so models refit at most every 50 candles.
+# This prevents O(n_candles) ARIMA/RF refits during backtesting and stops log-spam.
+_prediction_cache: dict = {}  # key → {'arima': ..., 'rf': ..., 'ensemble': ...}
+
+def _cache_key(df: "pd.DataFrame") -> int:
+    """Returns a bucket key that changes every 50 candles."""
+    return len(df) // 50
+
+
 class PredictionEngine:
     """
     Combines ARIMA time series forecasting with Random Forest classification
@@ -37,9 +46,19 @@ class PredictionEngine:
     
     def __init__(self, df: pd.DataFrame):
         self.df = df
-        self.arima_forecast = None
-        self.rf_probability = None
-        self.ensemble_score = None
+        key = _cache_key(df)
+        cached = _prediction_cache.get(key, {})
+        self.arima_forecast = cached.get('arima', None)
+        self.rf_probability = cached.get('rf', None)
+        self.ensemble_score = cached.get('ensemble', None)
+        self._cache_key = key
+
+    def _save_cache(self):
+        _prediction_cache[self._cache_key] = {
+            'arima': self.arima_forecast,
+            'rf': self.rf_probability,
+            'ensemble': self.ensemble_score,
+        }
     
     def generate_arima_forecast(self, periods: int = 20) -> Optional[Dict]:
         """
@@ -49,8 +68,9 @@ class PredictionEngine:
         if not ARIMA_AVAILABLE:
             return None
         
-        if len(self.df) < 100:
-            logger.warning("Insufficient data for ARIMA (need 100+ candles)")
+        # ARIMA(1,1,1) needs at minimum ~30 close prices to be well-identified
+        if len(self.df) < 30:
+            logger.debug("Skipping ARIMA: need at least 30 candles to fit (have %d)", len(self.df))
             return None
         
         try:
@@ -101,8 +121,9 @@ class PredictionEngine:
         if not RF_AVAILABLE:
             return None
         
-        if len(self.df) < 200:
-            logger.warning("Insufficient data for RF training (need 200+ candles)")
+        # RF needs enough samples to build meaningful splits after feature engineering
+        if len(self.df) < 50:
+            logger.debug("Skipping RF: need at least 50 candles to train (have %d)", len(self.df))
             return None
         
         try:
@@ -146,8 +167,8 @@ class PredictionEngine:
             # Drop NaN rows
             features_df = features_df.dropna()
             
-            if len(features_df) < 100:
-                logger.warning("Insufficient valid samples for RF training")
+            if len(features_df) < 30:
+                logger.debug("RF: only %d valid samples after feature engineering — skipping", len(features_df))
                 return None
             
             # Feature columns
@@ -168,15 +189,15 @@ class PredictionEngine:
             y_train = y[-train_size-gap-1:-gap-1]
             X_test = X[-1:] # Last candle
             
-            # Train Random Forest
+            # Train Random Forest — reduce complexity for small datasets
+            small_data = len(X_train) < 100
             scaler = StandardScaler()
             X_train_scaled = scaler.fit_transform(X_train)
             X_test_scaled = scaler.transform(X_test)
-            
             rf = RandomForestClassifier(
-                n_estimators=100,
-                max_depth=5,
-                min_samples_split=10,
+                n_estimators=50 if small_data else 100,
+                max_depth=3 if small_data else 5,
+                min_samples_split=2 if small_data else 10,
                 random_state=42,
                 n_jobs=-1
             )
@@ -198,8 +219,17 @@ class PredictionEngine:
         """
         Combines ARIMA and RF predictions into ensemble score (0.0 to 1.0).
         0.0 = strong bearish, 0.5 = neutral, 1.0 = strong bullish
+        Returns cached value if this bucket was already computed.
         """
-        # Generate predictions if not already done
+        # Return cached if already computed this bucket
+        if self.ensemble_score is not None:
+            return self.ensemble_score
+
+        # Early exit only if truly too short for even ARIMA(1,1,1) fitting
+        if len(self.df) < 30:
+            return None
+
+        # Generate predictions if not already cached
         if self.arima_forecast is None:
             self.generate_arima_forecast(periods=20)
         
@@ -226,8 +256,9 @@ class PredictionEngine:
         # Weighted average
         ensemble = np.average(scores, weights=weights)
         self.ensemble_score = ensemble
+        self._save_cache()  # Persist for the rest of this 50-candle bucket
         
-        logger.info(f"Ensemble prediction: {ensemble:.2f} (0=bearish, 0.5=neutral, 1=bullish)")
+        logger.debug(f"Ensemble prediction: {ensemble:.2f} (0=bearish, 0.5=neutral, 1=bullish)")
         return ensemble
     
     def get_prediction_signal_score(self) -> Tuple[float, str]:

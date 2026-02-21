@@ -212,26 +212,52 @@ class MarketAnalyzer:
         except Exception as e:
             logger.error(f"Error calculating Bollinger Bands: {e}")
 
-        # Volume Indicators (OBV, CMF)
+        # Volume Indicators — split into independent blocks so a VWAP failure
+        # does NOT wipe out OBV / CMF / VOL_MA (Bug #3 / #17 fix)
         try:
             df['OBV'] = ta.obv(df['close'], df['volume'])
-            df['CMF'] = ta.cmf(df['high'], df['low'], df['close'], df['volume'], length=20)
-            df['VOL_MA'] = ta.sma(df['volume'], length=ema_fast)
-            # ROUND 4 FIX: Add VWAP for institutional price benchmark
-            # A7 FIX: Daily-anchored VWAP (resets each day)
-            if 'timestamp' in df.columns:
-                df['_date'] = df['timestamp'].dt.date
-                vwap_parts = []
-                for _, group in df.groupby('_date'):
-                    v = ta.vwap(group['high'], group['low'], group['close'], group['volume'])
-                    vwap_parts.append(v)
-                df['VWAP'] = pd.concat(vwap_parts)
-                df.drop(columns=['_date'], inplace=True)
-            else:
-                # Fallback for data without timestamp
-                df['VWAP'] = ta.vwap(df['high'], df['low'], df['close'], df['volume'])
         except Exception as e:
-            logger.error(f"Error calculating volume indicators: {e}")
+            logger.error(f"Error calculating OBV: {e}")
+
+        try:
+            df['CMF'] = ta.cmf(df['high'], df['low'], df['close'], df['volume'], length=20)
+        except Exception as e:
+            logger.error(f"Error calculating CMF: {e}")
+
+        try:
+            df['VOL_MA'] = ta.sma(df['volume'], length=ema_fast)
+        except Exception as e:
+            logger.error(f"Error calculating VOL_MA: {e}")
+
+        # VWAP: daily-anchored, requires DatetimeIndex per group
+        # Suppress pandas_ta's stdout [!] message with redirect_stdout
+        import io
+        from contextlib import redirect_stdout
+        try:
+            if 'timestamp' in df.columns:
+                vwap_parts = []
+                df = df.sort_values('timestamp').reset_index(drop=True)
+                for date_val, group in df.groupby(df['timestamp'].dt.date):
+                    grp_indexed = group.sort_values('timestamp').set_index('timestamp')
+                    with redirect_stdout(io.StringIO()):  # silence [!] VWAP stdout
+                        v = ta.vwap(grp_indexed['high'], grp_indexed['low'],
+                                    grp_indexed['close'], grp_indexed['volume'])
+                    if v is not None:
+                        vwap_parts.append(v)
+                if vwap_parts:
+                    combined = pd.concat(vwap_parts)
+                    ts_to_vwap = dict(zip(combined.index, combined.values))
+                    df['VWAP'] = df['timestamp'].map(ts_to_vwap)
+            else:
+                df_indexed = df.copy()
+                df_indexed.index = pd.date_range('2000-01-01', periods=len(df), freq='1min')
+                with redirect_stdout(io.StringIO()):
+                    v = ta.vwap(df_indexed['high'], df_indexed['low'],
+                                df_indexed['close'], df_indexed['volume'])
+                if v is not None:
+                    df['VWAP'] = v.values
+        except Exception as e:
+            logger.warning(f"VWAP calculation failed (non-fatal): {e}")
         
         # Squeeze Detection (BB inside KC)
         try:
