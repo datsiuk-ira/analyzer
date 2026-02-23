@@ -3,6 +3,8 @@ import numpy as np
 from typing import Dict, List, Any, Type
 from strategy import BaseStrategy, SignalType, Signal
 from logger import logger
+# HOTFIX 1.2: Import SL floor + exchange leverage caps from risk_manager
+from risk_manager import MIN_SL_DISTANCE_PCT, EXCHANGE_MAX_LEVERAGE
 
 
 class Backtester:
@@ -51,7 +53,10 @@ class Backtester:
         if len(self.df) <= warmup and not self.settings.get('test_mode'):
             return {"error": "Insufficient data for backtest"}
 
-        FEE_RATE = 0.0004  # 0.04% per side taker rate (Bug #18 fix)
+        FEE_RATE = 0.0004      # 0.04% per side taker rate (Bug #18 fix)
+        # HOTFIX 2.2: Market-order slippage. Real 1m scalping fills are never at
+        # the last close price — bid/ask spread and queue position cost ~0.05%.
+        SLIPPAGE_RATE = 0.0005  # 0.05% slippage per fill
         
         # Pre-calculate indicators on the whole DF
         from analyzer import MarketAnalyzer
@@ -102,10 +107,26 @@ class Backtester:
         # Track last loss direction (removed anti-whipsaw — was blocking valid re-entries)
 
         start_index = warmup if not self.settings.get('test_mode') else 1
+        # HOTFIX 1.3: Track cooldown as a candle INDEX so the check persists
+        # across iterations. The old `cooldown_until` was an integer but was
+        # re-checked AFTER the bypass block, letting the circuit breaker be
+        # silently ignored. We now check this at the very top of every candle.
+        cooldown_until_index = 0  # replaces old cooldown_until variable
+
         for i in range(start_index, len(df)):
             current_row = df.iloc[i]
             timestamp = current_row['timestamp']
             price = current_row['close']
+
+            # ═══════════════════════════════════════════════
+            # Task 4.2: Cooldown gate — STRICT, NO EXCEPTIONS
+            # The old `can_bypass_cooldown` logic let Stagnation exits and
+            # half-risk SLs skip the circuit breaker, causing cascading losses.
+            # Deleted entirely: if the system is in cooldown, it stays in cooldown.
+            # ═══════════════════════════════════════════════
+            if i < cooldown_until_index:
+                self.equity_curve.append({'timestamp': timestamp, 'balance': self.balance})
+                continue
             
             # ═══════════════════════════════════════════════
             # 0. Check Pending Order Fill
@@ -121,8 +142,10 @@ class Backtester:
                         self.pending_order['modified'] = True
                         logger.debug(f"[PENDING] Modified limit to EMA_20={new_limit:.4f} at candle {i}")
 
-                # Expiry: 10 candles
-                if time_since_creation > 10:
+                # Task 5.3a: Expiry reduced from 10 → 3 candles.
+                # Scalping limit orders not filled in 3 minutes are stale —
+                # the micro-move we were targeting has already passed.
+                if time_since_creation > 3:  # Task 5.3a: was > 10
                     logger.debug(f"[PENDING] Expired at candle {i} (age={time_since_creation})")
                     self.pending_order = None
                 
@@ -143,12 +166,17 @@ class Backtester:
                     if filled:
                         sl_dist = self.pending_order['sl_dist']
                         tp_dist = self.pending_order['tp_dist']
-                        
+
+                        # HOTFIX 2.2: Apply slippage to limit fills
+                        # (gap-fills already use open/limit price, so slippage
+                        # still applies to model real spread on the fill candle)
                         if self.pending_order['direction'] == 'BUY':
+                            fill_price = fill_price * (1 + SLIPPAGE_RATE)
                             sl = fill_price - sl_dist
                             tp = fill_price + tp_dist
                             liq_price = fill_price * (1 - (0.8 / self.pending_order['leverage']))
                         else:
+                            fill_price = fill_price * (1 - SLIPPAGE_RATE)
                             sl = fill_price + sl_dist
                             tp = fill_price - tp_dist
                             liq_price = fill_price * (1 + (0.8 / self.pending_order['leverage']))
@@ -166,8 +194,11 @@ class Backtester:
                             'entry_time': timestamp,
                             'entry_fee': entry_fee,
                             'partial_tp_hit': False,
-                            # Partial TP at 0.8R — locks profit early before SL hits
-                            'partial_tp_price': fill_price + (0.8 * sl_dist) if self.pending_order['direction'] == 'BUY' else fill_price - (0.8 * sl_dist),
+                            # Task 5.2: Partial TP trigger changed from 1.0R → 0.6R.
+                            # On 1m BTC charts with tight stops, price often spikes
+                            # to 0.6-0.8R and reverses before reaching a full R.
+                            # Taking 50% off at 0.6R locks profit on these spikes.
+                            'partial_tp_price': fill_price + (0.6 * sl_dist) if self.pending_order['direction'] == 'BUY' else fill_price - (0.6 * sl_dist),
                             'leverage': self.pending_order['leverage'],
                             'atr': self.pending_order['atr'],
                             'avg_entry': fill_price,
@@ -205,10 +236,12 @@ class Backtester:
                 current_r = open_pnl / risk_amt if risk_amt > 0 else 0
                 
                 # ─── Time-Based Stagnation Exit ───
-                # If duration >= 40 candles and PnL < 1.0R, force exit
+                # Task 6.3a: 20 candles / 0.2R — gives high-leverage mean-reversion
+                # trades slightly more breathing room than the Task 5.1 15/0.5R threshold,
+                # while still cutting anything truly dead before it bleeds out.
                 entry_idx_val = trade.get('entry_index', i)
                 duration = i - entry_idx_val
-                if duration >= 40 and current_r < 1.0:
+                if duration >= 20 and current_r < 0.2:  # Task 6.3a: was `>= 15 and < 0.5`
                     hit_stagnation = True
                     logger.debug(f"[EXIT] Stagnation at candle {i}, duration={duration}, R={current_r:.2f}")
 
@@ -292,23 +325,29 @@ class Backtester:
                     # Priority: Liquidation > SL > TP > Partial TP
                     if current_row['low'] <= trade.get('liq_price', 0):
                         hit_liq = True
-                        exit_price = trade['liq_price']
+                        # HOTFIX 2.2: Slippage on liquidation (executed below liq price)
+                        exit_price = trade['liq_price'] * (1 - SLIPPAGE_RATE)
                     elif current_row['low'] <= trade['sl']:
                         hit_sl = True
-                        exit_price = trade['sl']
+                        # HOTFIX 2.2: Slippage on SL fill (selling into a falling market)
+                        exit_price = trade['sl'] * (1 - SLIPPAGE_RATE)
                     elif current_row['high'] >= trade['tp']:
                         hit_tp = True
-                        exit_price = trade['tp']
+                        # HOTFIX 2.2: Slippage on TP fill (slightly below TP level)
+                        exit_price = trade['tp'] * (1 - SLIPPAGE_RATE)
                     elif not trade.get('partial_tp_hit') and current_row['high'] >= trade.get('partial_tp_price', 999999):
-                        # Partial TP: close 70% at 0.8R (locks most profit), move SL to just above breakeven
+                        # Task 4.3 / HOTFIX 2.3: Partial TP at 1.0R — closes 50%, moves SL
+                        # to break-even WITH a 0.05% noise buffer (Task 4.4) so random
+                        # 1m spread/wick doesn't stop us out before the trend resumes.
                         trade['partial_tp_hit'] = True
-                        trade['sl'] = trade['avg_entry'] * 1.0005  # tight BE buffer 0.05%
+                        trade['sl'] = trade['avg_entry'] - (price * 0.0005)  # Task 4.4: 0.05% below BE
                         
-                        close_ratio = 0.70  # Close 70% — book profit aggressively
+                        close_ratio = 0.50  # HOTFIX 2.3: Was 0.70
                         partial_qty = trade['qty'] * close_ratio
                         trade['qty'] -= partial_qty
                         
-                        partial_exit_price = trade['partial_tp_price']
+                        # HOTFIX 2.2: Apply slippage to partial exit price
+                        partial_exit_price = trade['partial_tp_price'] * (1 - SLIPPAGE_RATE)
                         partial_fee = (partial_qty * partial_exit_price) * FEE_RATE
                         # qty = risk/SL_dist already encodes leverage — do NOT multiply again
                         partial_pnl = (partial_exit_price - trade['avg_entry']) * partial_qty - partial_fee
@@ -320,28 +359,33 @@ class Backtester:
                             'qty': partial_qty, 'fees': partial_fee,
                             'leverage': trade['leverage']
                         })
-                        logger.debug(f"[PARTIAL_TP] BUY closed {close_ratio*100:.0f}% at {partial_exit_price:.4f}, PnL={partial_pnl:.2f}")
+                        logger.debug(f"[PARTIAL_TP] BUY closed {close_ratio*100:.0f}% at {partial_exit_price:.4f}, PnL={partial_pnl:.2f}, SL→BE")
 
                 else:  # SELL
                     if current_row['high'] >= trade.get('liq_price', 999999):
                         hit_liq = True
-                        exit_price = trade['liq_price']
+                        # HOTFIX 2.2: Slippage on liquidation (executed above liq price)
+                        exit_price = trade['liq_price'] * (1 + SLIPPAGE_RATE)
                     elif current_row['high'] >= trade['sl']:
                         hit_sl = True
-                        exit_price = trade['sl']
+                        # HOTFIX 2.2: Slippage on SL fill (buying into a rising market)
+                        exit_price = trade['sl'] * (1 + SLIPPAGE_RATE)
                     elif current_row['low'] <= trade['tp']:
                         hit_tp = True
-                        exit_price = trade['tp']
+                        # HOTFIX 2.2: Slippage on TP fill (slightly above TP level)
+                        exit_price = trade['tp'] * (1 + SLIPPAGE_RATE)
                     elif not trade.get('partial_tp_hit') and current_row['low'] <= trade.get('partial_tp_price', 0):
-                        # SELL partial TP: close 70% at 0.8R, move SL to just below breakeven
+                        # Task 4.4: SELL partial TP — move SL to 0.05% ABOVE break-even
+                        # to absorb spread/noise before the short continues lower.
                         trade['partial_tp_hit'] = True
-                        trade['sl'] = trade['avg_entry'] * 0.9995  # tight BE buffer 0.05%
+                        trade['sl'] = trade['avg_entry'] + (price * 0.0005)  # Task 4.4: 0.05% above BE
                         
-                        close_ratio = 0.70  # Close 70% — book profit aggressively
+                        close_ratio = 0.50  # HOTFIX 2.3: Was 0.70
                         partial_qty = trade['qty'] * close_ratio
                         trade['qty'] -= partial_qty
                         
-                        partial_exit_price = trade['partial_tp_price']
+                        # HOTFIX 2.2: Apply slippage to SELL partial exit (buying back)
+                        partial_exit_price = trade['partial_tp_price'] * (1 + SLIPPAGE_RATE)
                         partial_fee = (partial_qty * partial_exit_price) * FEE_RATE
                         # qty encodes leverage — do NOT multiply again
                         partial_pnl = (trade['avg_entry'] - partial_exit_price) * partial_qty - partial_fee
@@ -353,11 +397,15 @@ class Backtester:
                             'qty': partial_qty, 'fees': partial_fee,
                             'leverage': trade['leverage']
                         })
-                        logger.debug(f"[PARTIAL_TP] SELL closed {close_ratio*100:.0f}% at {partial_exit_price:.4f}, PnL={partial_pnl:.2f}")
+                        logger.debug(f"[PARTIAL_TP] SELL closed {close_ratio*100:.0f}% at {partial_exit_price:.4f}, PnL={partial_pnl:.2f}, SL→BE")
 
                 # ─── Stagnation / Climax exit price (applies to BOTH directions) ───
+                # HOTFIX 2.2: Apply slippage to market exits (stagnation / climax)
                 if (hit_stagnation or hit_climax) and exit_price == 0:
-                    exit_price = current_row['close']
+                    if trade['direction'] == 'BUY':
+                        exit_price = current_row['close'] * (1 - SLIPPAGE_RATE)
+                    else:
+                        exit_price = current_row['close'] * (1 + SLIPPAGE_RATE)
 
                 # ─── Close Trade ───
                 if hit_sl or hit_tp or hit_liq or hit_stagnation or hit_climax:
@@ -406,7 +454,19 @@ class Backtester:
                         self.consecutive_losses = 0
                     
                     self.trades.append(trade)
-                    cooldown_until = i + cooldown_candles
+                    # HOTFIX 1.3: Use cooldown_until_index (set at top of loop)
+                    cooldown_until_index = i + cooldown_candles
+                    
+                    # PATCH 2: On a Stop-Loss / Liquidation hit, force a 30-minute lock
+                    # to mirror SymbolLockManager.lock() in the live bot.
+                    # Skip in test_mode so unit-test candle counts are not disrupted.
+                    if (hit_sl or hit_liq) and not self.settings.get('test_mode'):
+                        sl_cooldown = max(cooldown_candles, 30 // tf_minutes)
+                        cooldown_until_index = i + sl_cooldown
+                        logger.info(
+                            f"[SL_LOCK] SL/LIQ hit at candle {i}. "
+                            f"Cooldown until candle {cooldown_until_index} ({sl_cooldown} candles)."
+                        )
                     
                     # Store exit context for re-entry bypass
                     self.last_exit_reason = result_str
@@ -420,21 +480,8 @@ class Backtester:
             # ═══════════════════════════════════════════════
             # 2. Signal Generation (only if no active trade AND no pending order)
             # ═══════════════════════════════════════════════
-            
-            # Aggressive Re-entry: bypass cooldown after Stagnation
-            can_bypass_cooldown = False
-            if self.last_exit_reason == 'Stagnation':
-                can_bypass_cooldown = True
-            if self.last_exit_half_risk and self.last_exit_reason == 'SL':
-                can_bypass_cooldown = True
-
-            # Only bypass if within 10 candles of exit
-            if can_bypass_cooldown and (i - self.last_exit_index <= 10):
-                pass  # Allow through
-            else:
-                if i < cooldown_until:
-                    self.equity_curve.append({'timestamp': timestamp, 'balance': self.balance})
-                    continue
+            # NOTE: Cooldown check + bypass logic has been MOVED to the top of
+            # the loop (HOTFIX 1.3) so it cannot be skipped by any code path.
 
             # Hard stop: never enter new trades on a blown account
             if self.balance <= 0:
@@ -456,80 +503,89 @@ class Backtester:
                 # REMOVED: Anti-whipsaw filter (was blocking valid re-entries)
                 
                 if signal.type != SignalType.NEUTRAL:
-                    # Circuit Breaker: 3 consecutive losses -> 60m cooldown
+                    # HOTFIX 1.3 — Circuit Breaker: 3 consecutive losses → 30m cooldown
+                    # Setting cooldown_until_index here is enough — the gate at the
+                    # TOP of the for-loop will enforce it on every subsequent candle.
                     if self.consecutive_losses >= 3:
-                        cooldown_until = i + (30 // tf_minutes)  # 30min cooldown (was 60min — too aggressive)
+                        cooldown_until_index = i + (30 // tf_minutes)
                         self.consecutive_losses = 0
-                        logger.info(f"[CIRCUIT_BREAKER] 3 consecutive losses, 30m cooldown from candle {i}")
+                        logger.info(f"[CIRCUIT_BREAKER] 3 consecutive losses, 30m cooldown until candle {cooldown_until_index}")
                         self.equity_curve.append({'timestamp': timestamp, 'balance': self.balance})
                         continue
 
-                    # ─── VAL (Volatility-Adjusted Leverage) ───
+                    # ─── Task 6.1: Margin-Based Position Sizing ───────────────────────
+                    # Fetch signal attributes first — needed by both sizing and entry logic.
                     atr_val = getattr(signal, 'atr', price * 0.01)
-                    # 1.0 ATR SL: tight enough to enable high leverage, wide enough for micro noise
-                    min_sl_dist = 1.0 * atr_val
-                    min_sl_pct = min_sl_dist / price
-                    
-                    # Risk 5% of balance per trade (scalping high-leverage: smaller risk per trade)
-                    target_risk_pct = 0.05
-                    current_leverage = target_risk_pct / min_sl_pct if min_sl_pct > 0 else 1.0
-                    
-                    # Dynamic leverage cap: 50x-125x based on signal strength
-                    # signal.strength = score/4.0, so score=4.5→strength≈1.125, score=6.0→strength=1.5
+                    adx_val = getattr(signal, 'adx', 0)
+
+                    # Previous: risk-based sizing (1% risk ÷ SL%) → implied leverage ~3x
+                    # Problem:  tiny position size produces negligible PnL at tight stops.
+                    # Fix:      map signal score directly to a target leverage, then size
+                    #           the position by allocating a fixed 3% margin slice.
+                    #
+                    # Signal score brackets (same as institutional leverage tiers):
+                    #   score > 5.5  →  125x  (A+ setup: maximum conviction)
+                    #   score ≥ 4.5  →   80x  (A  setup: strong confluence)
+                    #   score < 4.5  →   50x  (B  setup: baseline scalp)
                     signal_score = getattr(signal, 'strength', 1.0) * 4.0
-                    if signal_score >= 6.0:
-                        max_leverage = 125.0  # Very strong signal
-                    elif signal_score >= 5.5:
-                        max_leverage = 100.0
-                    elif signal_score >= 5.0:
-                        max_leverage = 75.0
+                    if signal_score > 5.5:
+                        mapped_leverage = 125.0
+                    elif signal_score >= 4.5:
+                        mapped_leverage = 80.0
                     else:
-                        max_leverage = 50.0   # Minimum for scalping
-                    current_leverage = max(3.0, min(current_leverage, max_leverage))
+                        mapped_leverage = 50.0
+
+                    # Cap by per-symbol exchange limit
+                    _symbol = self.settings.get('symbol', '')
+                    _base = _symbol.split('/')[0].upper() if '/' in _symbol else 'DEFAULT'
+                    exchange_cap = EXCHANGE_MAX_LEVERAGE.get(_base, EXCHANGE_MAX_LEVERAGE['DEFAULT'])
+                    current_leverage = min(mapped_leverage, exchange_cap)
                     current_leverage = round(current_leverage, 1)
-                    
-                    # Bug #2 fix: correct risk-based position sizing
-                    # qty × SL_distance = risk_amount → qty = risk_amount / SL_distance
-                    risk_amount = self.balance * target_risk_pct
-                    sl_distance = price * min_sl_pct
-                    qty = risk_amount / sl_distance if sl_distance > 0 else 0
-                    position_value = qty * price
-                    
-                    sl_dist_pct = min_sl_pct
-                    
-                    target_rr = getattr(signal, 'dynamic_rr', 1.5)  # Default 1.5R — actually achievable on 1m
-                    tp_dist_pct = sl_dist_pct * target_rr
+
+                    # 3% of balance used as collateral margin
+                    MARGIN_PCT = 0.03
+                    margin_amount = self.balance * MARGIN_PCT
+                    position_value = margin_amount * current_leverage
+                    qty = position_value / price if price > 0 else 0
+
+                    # SL/TP distances — 1.0 ATR floor (min 0.35%), fixed 1.5R target
+                    sl_dist_pct = max(1.0 * atr_val / price, MIN_SL_DISTANCE_PCT)
+                    tp_dist_pct = sl_dist_pct * 1.5  # Task 6.1: hardcoded 1.5R, fast scalping
+                    # ─────────────────────────────────────────────────────────────────
 
                     # ─── Entry Logic ───
-                    adx_val = getattr(signal, 'adx', 0)
-                    atr_val = getattr(signal, 'atr', price * 0.01)
-                    
-                    # Aggressive Market Entry (Strong Trend, ADX > 30)
-                    if adx_val > 30:
+
+                    # Task 6.3b: Market entry for ANY confirmed signal with ADX > 15.
+                    if adx_val > 15:  # Task 6.3b: was `20 < adx_val < 35`
+                        # HOTFIX 2.2: Worsen market entry price by slippage
                         if signal.type == SignalType.BUY:
-                            sl = price - (price * sl_dist_pct)
-                            tp = price + (price * tp_dist_pct)
-                            liq_price = price * (1 - (0.8 / current_leverage))
+                            executed_price = price * (1 + SLIPPAGE_RATE)
+                            sl = executed_price - (executed_price * sl_dist_pct)
+                            tp = executed_price + (executed_price * tp_dist_pct)
+                            liq_price = executed_price * (1 - (0.8 / current_leverage))
                         else:
-                            sl = price + (price * sl_dist_pct)
-                            tp = price - (price * tp_dist_pct)
-                            liq_price = price * (1 + (0.8 / current_leverage))
+                            executed_price = price * (1 - SLIPPAGE_RATE)
+                            sl = executed_price + (executed_price * sl_dist_pct)
+                            tp = executed_price - (executed_price * tp_dist_pct)
+                            liq_price = executed_price * (1 + (0.8 / current_leverage))
                         
-                        entry_fee = (qty * price) * FEE_RATE
+                        entry_fee = (qty * executed_price) * FEE_RATE
                         self.active_trade = {
                             'symbol': 'BACKTEST', 'direction': signal.type.value,
-                            'entry': price, 'qty': qty,
+                            'entry': executed_price, 'qty': qty,
                             'original_qty': qty,
                             'entry_index': i,
                             'sl': sl, 'tp': tp, 'liq_price': liq_price,
                             'entry_time': timestamp,
                             'entry_fee': entry_fee,
                             'partial_tp_hit': False,
-                            # Partial TP at 0.8R — locks profit before SL can be hit on most moves
-                            'partial_tp_price': price + (0.8 * (price * sl_dist_pct)) if signal.type == SignalType.BUY else price - (0.8 * (price * sl_dist_pct)),
+                            # Task 5.2: Partial TP trigger at 0.6R (was 1.0R).
+                            # 0.6R is achievable on quick 1m scalps; waiting for
+                            # 1.0R forfeited profits on reversal spikes.
+                            'partial_tp_price': executed_price + (0.6 * (executed_price * sl_dist_pct)) if signal.type == SignalType.BUY else executed_price - (0.6 * (executed_price * sl_dist_pct)),
                             'leverage': current_leverage,
                             'atr': atr_val,
-                            'avg_entry': price,
+                            'avg_entry': executed_price,
                             'pyramided': False,
                             # ── Why this trade was selected ──
                             'signal_reason': signal.reason,
@@ -538,16 +594,19 @@ class Backtester:
                             'strategy_name': signal.strategy_name,
                         }
                         self.balance -= entry_fee
-                        logger.info(f"[ENTRY] Aggressive Market {signal.type.value} at {price:.4f}, Lev={current_leverage}x, SL={sl:.4f}, TP={tp:.4f}")
+                        logger.info(f"[ENTRY] Aggressive Market {signal.type.value} at {executed_price:.4f} (slip={SLIPPAGE_RATE:.4%}), Lev={current_leverage}x, SL={sl:.4f}, TP={tp:.4f}")
                         self.equity_curve.append({'timestamp': timestamp, 'balance': self.balance})
                         continue
 
-                    # Limit Logic with Dynamic Offset
+                    # Task 5.3b: Limit offset changed from 0.20 ATR → 1.0 ATR.
+                    # A 0.20 ATR offset was barely larger than noise — orders
+                    # filled on bad-price candles instead of real pullbacks.
+                    # 1.0 ATR forces the bot to wait for a meaningful retracement.
                     limit_offset = 0.0
                     if adx_val > 25:
                         limit_offset = 0.0
                     else:
-                        limit_offset = atr_val * 0.20
+                        limit_offset = atr_val * 1.0  # Task 5.3b: was 0.20
 
                     if signal.type == SignalType.BUY:
                         limit_price = price - limit_offset

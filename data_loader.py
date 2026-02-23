@@ -9,6 +9,71 @@ from logger import logger
 import aiohttp
 import os
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HOTFIX 2.1: In-memory symbol lock manager for async / live-bot contexts.
+#
+# Mirrors the DatabaseManager.lock_symbol / is_symbol_locked interface but
+# stores state in a class-level dict so it's available without a DB round-trip.
+# The bot_scanner and data pipeline should call is_locked() BEFORE fetching
+# OHLCV data to skip locked symbols entirely (no API call, no indicator calc).
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SymbolLockManager:
+    """
+    Thread-safe (via GIL) in-memory lock manager for symbol/timeframe pairs.
+
+    Keys are tuples ``(symbol, timeframe)``; values are Unix epoch timestamps
+    after which the lock expires.
+
+    Usage (live bot / async scanner)::
+
+        SymbolLockManager.lock('BTC/USDT', '1m', minutes=30, reason='SL hit')
+        if SymbolLockManager.is_locked('BTC/USDT', '1m'):
+            return  # skip this symbol
+    """
+    _locks: Dict[tuple, float] = {}  # (symbol, timeframe) -> expiry epoch
+
+    @classmethod
+    def lock(cls, symbol: str, timeframe: str,
+             minutes: float, reason: str = '') -> None:
+        """Lock a symbol/timeframe pair for ``minutes`` minutes."""
+        expiry = time.time() + minutes * 60.0
+        cls._locks[(symbol, timeframe)] = expiry
+        logger.info(
+            f"[SYMBOL_LOCK] {symbol}/{timeframe} locked for {minutes:.1f}m. "
+            f"Reason: {reason}"
+        )
+
+    @classmethod
+    def is_locked(cls, symbol: str, timeframe: str) -> bool:
+        """Return True if the pair is currently locked."""
+        expiry = cls._locks.get((symbol, timeframe))
+        if expiry is None:
+            return False
+        if time.time() < expiry:
+            remaining_min = (expiry - time.time()) / 60.0
+            logger.debug(
+                f"[SYMBOL_LOCK] {symbol}/{timeframe} locked for "
+                f"{remaining_min:.1f}m more — skipping."
+            )
+            return True
+        # Lock expired — clean up
+        del cls._locks[(symbol, timeframe)]
+        return False
+
+    @classmethod
+    def unlock(cls, symbol: str, timeframe: str) -> None:
+        """Manually remove a lock."""
+        cls._locks.pop((symbol, timeframe), None)
+        logger.info(f"[SYMBOL_LOCK] {symbol}/{timeframe} manually unlocked.")
+
+    @classmethod
+    def active_locks(cls) -> Dict[tuple, float]:
+        """Return a snapshot of currently active (non-expired) locks."""
+        now = time.time()
+        return {k: v for k, v in cls._locks.items() if v > now}
+
 class DataFetcher(ABC):
     """
     Abstract Base Class for fetching market data.
@@ -202,6 +267,14 @@ class BinanceFetcher(DataFetcher):
         Fetches OHLCV data from Binance Futures asynchronously with caching.
         Supports limits > 1000 via paginated batch requests (Binance caps each call at 1000).
         """
+        # HOTFIX 2.1: Early exit if this symbol/timeframe is locked.
+        # Skipping here means zero API calls and zero indicator CPU for locked pairs.
+        if SymbolLockManager.is_locked(symbol, timeframe):
+            logger.debug(
+                f"[FETCH] Skipping {symbol}/{timeframe} — symbol is locked."
+            )
+            return pd.DataFrame()
+
         # Normalize limit to a safe max
         BATCH_SIZE = 1000  # Binance REST API hard cap per request
 

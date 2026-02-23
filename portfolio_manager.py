@@ -6,6 +6,9 @@ from datetime import datetime
 from typing import Optional
 import json
 
+# PATCH 2: Import in-memory lock manager for live-bot overtrading protection
+from data_loader import SymbolLockManager
+
 from notifications import NotificationManager
 
 class PortfolioManager:
@@ -206,6 +209,18 @@ class PortfolioManager:
                 logger.info(f"SL HIT: {symbol} | Raw PnL={raw_pnl:.2f}, Fee={fee:.2f}, Net PnL={pnl:.2f}")
                 
                 self._close_trade(trade_id, portfolio_id, exit_price, pnl, new_status, symbol=symbol)
+                
+                # PATCH 2: Lock this symbol/timeframe pair for 30 minutes to
+                # prevent the scanner from immediately re-entering after a loss.
+                # Uses both in-memory lock (instant, no disk I/O) and DB lock
+                # (survives process restart).
+                _timeframe = trade.get('timeframe', '1m')  # fallback to 1m if not stored
+                SymbolLockManager.lock(symbol, _timeframe, minutes=30, reason='SL hit')
+                try:
+                    self.db.lock_symbol(symbol, _timeframe, minutes=30, reason='SL hit')
+                except Exception as _e:
+                    logger.warning(f"[SL_LOCK] DB lock failed for {symbol}: {_e}")
+                
                 continue
 
             if hit_tp and status == 'OPEN':

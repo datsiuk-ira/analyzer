@@ -115,11 +115,9 @@ class TestAggressiveFeatures:
 
     def test_val_leverage_calculation(self):
         """
-        Verify Volatility-Adjusted Leverage.
-        ATR = 1% (1.0 on price 100). Min SL Dist = 1.0 ATR = 1.0%.
-        Target Risk = 5%.
-        Leverage = 5% / 1.0% = 5.0x.
-        Signal score ~4.5 → max_leverage=50x, formula gives 5.0x → actual=5.0x
+        Verify Margin-Based Leverage (Task 6.1).
+        signal.strength=1.0 → signal_score = 4.0 → mapped_leverage = 50x.
+        DEFAULT exchange cap = 50x → final leverage = 50x.
         """
         prices = [100.0] * 10
         prices[4] = 110.0  # Force TP hit
@@ -128,7 +126,7 @@ class TestAggressiveFeatures:
         backtester = Backtester(df, MockStrategy, {'test_mode': True})
         strategy = MockStrategy(df.iloc[:2], None, {})
     
-        sig = make_signal(adx=35, atr=1.0)
+        sig = make_signal(adx=30, atr=1.0)  # adx=30 → market entry (ADX > 15)
         signals = [Signal(SignalType.NEUTRAL, "", "")] * 10
         signals[1] = sig
         strategy.signals_list = signals
@@ -139,7 +137,10 @@ class TestAggressiveFeatures:
         assert len(backtester.trades) >= 1
         last_trade = backtester.trades[-1]
         if last_trade['result'] != 'PYRAMID_ENTRY':
-            assert last_trade['leverage'] == 5.0  # 5% / 1.0% = 5.0x (SL = 1.0 ATR, risk = 5%)
+            # Task 6.1: score=4.0 → mapped_leverage=50x, capped at DEFAULT=50x
+            assert last_trade['leverage'] == 50.0
+
+
 
     def test_val_and_pyramiding(self):
         """
@@ -170,20 +171,23 @@ class TestAggressiveFeatures:
         assert 'PYRAMID_ENTRY' in reasons
 
     def test_reentry_bypass(self):
-        """Verify Aggressive Re-entry: Bypass cooldown after Stagnation Exit."""
+        """Verify re-entry after Stagnation Exit (Task 5.1: exits at 15 candles / 0.5R)."""
         p = [100.0] * 60
-        df = create_mock_df(np.array(p), adx=35)
+        # adx=30: market entry zone (20 < adx < 35) so trades open on flat prices.
+        # adx=35 would route to limit orders which expire unfilled at 1.0 ATR offset.
+        df = create_mock_df(np.array(p), adx=30)
         
         backtester = Backtester(df, MockStrategy, {'test_mode': True})
         strategy = MockStrategy(df.iloc[:2], None, {})
         
-        sig1 = make_signal(adx=35, label="1")
-        sig2 = make_signal(adx=35, label="2")
+        sig1 = make_signal(adx=30, label="1")
+        sig2 = make_signal(adx=30, label="2")
         
         signals = [Signal(SignalType.NEUTRAL, "", "")] * 60
         signals[1] = sig1
-        # Stagnation exit ~candle 41 (40 candles). Re-entry at 43.
-        signals[43] = sig2
+        # Task 5.1: Stagnation now exits at candle ~16 (entry=1, 15-candle window).
+        # Re-entry signal at candle 20 — well past the expiry.
+        signals[20] = sig2
         strategy.signals_list = signals
         
         backtester.strategy_class = lambda *args: strategy
@@ -192,7 +196,6 @@ class TestAggressiveFeatures:
         assert len(backtester.trades) >= 1
         assert backtester.trades[0]['result'] == 'Stagnation'
         
-        # If bypass worked, Trade 2 should exist
         has_second = len(backtester.trades) >= 2 or backtester.active_trade is not None
         assert has_second, "Re-entry failed (Cooldown blocked it?)"
 
@@ -239,7 +242,7 @@ class TestProtection:
         assert len(real) == 3, f"Expected 3 trades, got {len(real)}: {[t['result'] for t in real]}"
 
     def test_stagnation_exit(self):
-        """Verify exit after 40 candles if PnL < 1R."""
+        """Verify exit after 15 candles if PnL < 0.5R (Task 5.1: was 40 candles / 1.0R)."""
         prices = [100.0] * 60
         df = create_mock_df(np.array(prices))
         backtester = Backtester(df, MockStrategy, {'test_mode': True})
@@ -256,9 +259,9 @@ class TestProtection:
         stag_trades = [t for t in backtester.trades if t['result'] == 'Stagnation']
         assert len(stag_trades) >= 1
         trade = stag_trades[0]
-        # Entry at i=1. Exit at i=41 (1+40).
+        # Task 5.1: Entry at i=1. Exit at i=16 (1+15). Duration = 15 minutes.
         duration_minutes = (trade['exit_time'] - trade['entry_time']).total_seconds() / 60
-        assert duration_minutes >= 40
+        assert duration_minutes >= 15  # Task 5.1: was >= 40
 
 
 # ═══════════════════════════════════════════════

@@ -60,9 +60,20 @@ class ScalpingStrategy(BaseStrategy):
 
         last_row = self.df.iloc[index]
         current_row = self.df.iloc[-1]
-        
+
+        # Task 5.4: Volume / Chop Filter — evaluated FIRST, before any scoring.
+        # A candle with volume < 80% of the 20-period SMA signals a dead market.
+        # Entries in these conditions are filled at the spread — guaranteed losers.
+        try:
+            vol_sma = self.df['volume'].rolling(20).mean().iloc[-1] if len(self.df) >= 20 else self.df['volume'].mean()
+        except Exception:
+            vol_sma = float('nan')
+        if not pd.isna(vol_sma) and vol_sma > 0 and current_row['volume'] < 0.8 * vol_sma:
+            return Signal(SignalType.NEUTRAL, "Low Volume Chop", "Volume Filter")  # Task 5.4
+
         rsi_overbought = self.settings.get('rsi_overbought', 70)
         rsi_oversold = self.settings.get('rsi_oversold', 30)
+
 
         # 1. ADX Filter (Market Strength)
         adx_value = self._get_scalar(last_row, 'ADX')
@@ -130,10 +141,12 @@ class ScalpingStrategy(BaseStrategy):
         if rsi_crossed_up: long_score_map['RSI_Cross'] = 1.5
         if rsi_crossed_down: short_score_map['RSI_Cross'] = 1.5
         
-        # 3b. RSI Extreme Zones Bonus (ROUND 2: New +0.5 for strong extremes)
+        # 3b. RSI Extreme Zones — Task 6.2: HEAVY WEIGHT for mean-reversion alpha.
+        # RSI < 30 and RSI > 70 are statistically the highest-probability snap-back
+        # zones on 1m BTC. Weighting at 2.0 ensures these dominate the score.
         rsi_val = self._get_scalar(last_row, 'RSI', 50)
-        if rsi_val < 25: long_score_map['RSI_Extreme'] = 0.5
-        if rsi_val > 75: short_score_map['RSI_Extreme'] = 0.5
+        if rsi_val < 30: long_score_map['RSI_Oversold'] = 2.0   # Task 6.2: was 0.5 at 25 threshold
+        if rsi_val > 70: short_score_map['RSI_Overbought'] = 2.0 # Task 6.2: was 0.5 at 75 threshold
         
         # 4. RSI Divergence
         if has_bull_div: long_score_map['RSI_Div'] = 2.0
@@ -240,25 +253,26 @@ class ScalpingStrategy(BaseStrategy):
         elif funding_rate < -0.0001: # High negative funding (crowded shorts)
             long_score_map['Funding'] = 0.5
 
-        # 14. ROUND 3: ML Prediction Model Score
+        # 14. PHASE 3 — ML Ensemble Meta-Score (Task 3.6)
+        # Replaces the old ARIMA + Random Forest PredictionEngine.
+        # EnsemblePredictor runs XGBoost + Prophet + LSTM and returns:
+        #   +2.0  Strong Long  (all three models agree bullish)
+        #   -2.0  Strong Short (all three models agree bearish)
+        #    0.0  Neutral / insufficient confidence
+        # The backwards-compat PredictionEngine shim keeps get_ensemble_score()
+        # working for any other callers in the codebase.
         if use_prediction:
             try:
-                from prediction import PredictionEngine
-                predictor = PredictionEngine(self.df.iloc[:index+1])
-                ensemble = predictor.get_ensemble_score()
-                if ensemble is not None:
-                    # Strong bullish prediction
-                    if ensemble > 0.65:
-                        long_score_map['ML_Prediction'] = 1.5
-                    elif ensemble > 0.55:
-                        long_score_map['ML_Prediction'] = 0.5
-                    # Strong bearish prediction
-                    elif ensemble < 0.35:
-                        short_score_map['ML_Prediction'] = 1.5
-                    elif ensemble < 0.45:
-                        short_score_map['ML_Prediction'] = 0.5
+                from prediction import EnsemblePredictor
+                _ensemble_pred = EnsemblePredictor()
+                _symbol = getattr(self, 'symbol', 'ASSET')
+                meta_score = _ensemble_pred.get_meta_score(_symbol, self.df.iloc[:index+1])
+                if meta_score > 0:
+                    long_score_map['ML_Ensemble'] = meta_score       # +2.0
+                elif meta_score < 0:
+                    short_score_map['ML_Ensemble'] = abs(meta_score) # +2.0 to short
             except Exception as e:
-                logger.debug(f"Prediction module failed: {e}")
+                logger.debug(f"EnsemblePredictor skipped: {e}")
 
         # ROUND 4 FIX: Add 6 new scoring components using already-calculated indicators
         
@@ -272,7 +286,9 @@ class ScalpingStrategy(BaseStrategy):
                 if macd_hist < 0 and macd_hist < prev_hist:
                     short_score_map['MACD_Momentum'] = 1.0  # Falling bearish histogram
 
-        # 16. Bollinger Band Position
+        # 16. Bollinger Band Position — Task 6.2: Raised to 2.0 for mean-reversion alpha.
+        # Price closing OUTSIDE the bands is the strongest 1m exhaustion signal.
+        # The previous 1.0 weight undersold this edge; 2.0 makes it a primary factor.
         bb_upper_cols = [c for c in self.df.columns if c.startswith('BBU_')]
         bb_lower_cols = [c for c in self.df.columns if c.startswith('BBL_')]
         if bb_lower_cols and bb_upper_cols:
@@ -281,10 +297,10 @@ class ScalpingStrategy(BaseStrategy):
             if not pd.isna(bb_upper) and not pd.isna(bb_lower) and bb_upper != bb_lower:
                 price = self._get_scalar(last_row, 'close')
                 bb_pct = (price - bb_lower) / (bb_upper - bb_lower)
-                if bb_pct < 0.2:  # Near lower band = oversold
-                    long_score_map['BB_Oversold'] = 1.0
-                if bb_pct > 0.8:  # Near upper band = overbought
-                    short_score_map['BB_Overbought'] = 1.0
+                if bb_pct < 0.2:  # Near/below lower band = oversold
+                    long_score_map['BB_Oversold'] = 2.0   # Task 6.2: was 1.0
+                if bb_pct > 0.8:  # Near/above upper band = overbought
+                    short_score_map['BB_Overbought'] = 2.0 # Task 6.2: was 1.0
 
         # 17. OBV Slope (volume momentum)
         if 'OBV' in self.df.columns and index >= 5:
@@ -445,8 +461,10 @@ class ScalpingStrategy(BaseStrategy):
         body_filter_ok = (body_size >= vol_threshold * total_range) if total_range > 0 else False
 
         # Balanced thresholds: quality signals with reasonable frequency
-        MIN_SCORE = 4.5  # Balanced: higher than original 4.0, lower than over-strict 5.5
-        # Super-Trend (ADX > 35): slightly easier entry
+        # Task 6.2: MIN_SCORE raised to 4.5 baseline — only A-grade setups with
+        # multiple confluences should fire (RSI + BB alone = 4.0, need one more)
+        MIN_SCORE = 4.5  # Task 6.2: enforces multi-confluence A-grade requirement
+        # Super-Trend (ADX > 35): slightly easier entry for extreme momentum
         if adx_value > 35:
             MIN_SCORE = 4.0
 

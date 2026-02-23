@@ -129,6 +129,24 @@ class DatabaseManager:
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_signal_history_symbol ON signal_history(symbol, timestamp)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_trade_logs_trade ON trade_logs(trade_id, timestamp)')
         
+        # HOTFIX 2.1: Global symbol lock table.
+        # Prevents the bot from opening multiple trades on the same symbol/timeframe
+        # pair within a cooldown window (e.g. after a Stop-Loss or Partial TP).
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS trading_state (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol              TEXT    NOT NULL,
+                timeframe           TEXT    NOT NULL,
+                lock_until_timestamp REAL   NOT NULL,  -- Unix epoch seconds
+                reason              TEXT,
+                UNIQUE(symbol, timeframe) ON CONFLICT REPLACE
+            )
+        ''')
+        cursor.execute(
+            'CREATE INDEX IF NOT EXISTS idx_trading_state_lookup '
+            'ON trading_state(symbol, timeframe, lock_until_timestamp)'
+        )
+        
         conn.commit()
         # Only log if it's the first time we're initializing in this process
         if not _DB_INITIALIZED:
@@ -159,3 +177,65 @@ class DatabaseManager:
         if self._conn:
             self._conn.close()
             self._conn = None
+
+    # ─────────────────────────────────────────────────────────────────
+    # HOTFIX 2.1: Symbol lock helpers (global overtrading protection).
+    # Used by live bot AND by the backtester's in-memory equivalent.
+    # ─────────────────────────────────────────────────────────────────
+
+    @retry_db_transaction()
+    def lock_symbol(self, symbol: str, timeframe: str,
+                    minutes: float, reason: str = '') -> None:
+        """
+        Locks ``symbol/timeframe`` for ``minutes`` minutes.
+        Any new lock on the same pair replaces the old one (upsert via UNIQUE
+        ON CONFLICT REPLACE defined on the table).
+
+        Call this after a Stop-Loss exit or when taking a Partial TP.
+        """
+        import time as _time
+        lock_until = _time.time() + minutes * 60.0
+        self.execute_query(
+            '''
+            INSERT INTO trading_state (symbol, timeframe, lock_until_timestamp, reason)
+            VALUES (?, ?, ?, ?)
+            ''',
+            (symbol, timeframe, lock_until, reason)
+        )
+        logger.info(
+            f"[LOCK] {symbol}/{timeframe} locked for {minutes:.1f}m. Reason: {reason}"
+        )
+
+    def is_symbol_locked(self, symbol: str, timeframe: str) -> bool:
+        """
+        Returns True if the symbol/timeframe pair is currently locked
+        (i.e. the lock has not yet expired).
+
+        Call this early in the pipeline to skip data fetching entirely.
+        """
+        import time as _time
+        now = _time.time()
+        result = self.fetch_all(
+            '''
+            SELECT lock_until_timestamp FROM trading_state
+            WHERE symbol = ? AND timeframe = ? AND lock_until_timestamp > ?
+            LIMIT 1
+            ''',
+            (symbol, timeframe, now)
+        )
+        locked = not result.empty
+        if locked:
+            remaining = result.iloc[0]['lock_until_timestamp'] - now
+            logger.debug(
+                f"[LOCK] {symbol}/{timeframe} is locked for {remaining/60:.1f}m more."
+            )
+        return locked
+
+    @retry_db_transaction()
+    def unlock_symbol(self, symbol: str, timeframe: str) -> None:
+        """Manually remove a lock (e.g. on graceful shutdown or strategy reset)."""
+        self.execute_query(
+            'DELETE FROM trading_state WHERE symbol = ? AND timeframe = ?',
+            (symbol, timeframe)
+        )
+        logger.info(f"[LOCK] {symbol}/{timeframe} manually unlocked.")

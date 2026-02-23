@@ -6,3 +6,9 @@ pandas_ta
 plotly
 streamlit-autorefresh
 pyTelegramBotAPI
+# Phase 3: ML Ensemble — Task 3.1
+xgboost
+prophet
+torch
+scikit-learn
+numpy

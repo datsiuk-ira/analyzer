@@ -2,6 +2,20 @@ from typing import Tuple, Optional
 import pandas as pd
 from logger import logger
 
+# HOTFIX 1.2: Absolute minimum SL distance from entry.
+# A stop-loss closer than 0.35% will be immediately triggered by exchange
+# fees (~0.04% per side) plus typical bid/ask spread on 1m scalping.
+MIN_SL_DISTANCE_PCT = 0.0035  # 0.35% floor
+
+# Per-symbol max-leverage caps enforced by exchanges.
+# Key = base currency prefix (uppercase). 'DEFAULT' is the fallback for altcoins.
+EXCHANGE_MAX_LEVERAGE: dict = {
+    'BTC':     125,
+    'ETH':     100,
+    'BNB':     75,
+    'DEFAULT': 50,   # Conservative cap for all other altcoins
+}
+
 class RiskCalculator:
     """
     Class responsible for risk management and position sizing.
@@ -24,11 +38,17 @@ class RiskCalculator:
             actual_multiplier = min(atr_multiplier, 1.5) # Max 1.5 ATR for squeeze breakouts
             
         if signal_type == "BUY":
-            stop_loss = current_price - (atr * actual_multiplier)
+            # HOTFIX 1.2: Enforce minimum 0.35% SL distance
+            raw_sl_distance = atr * actual_multiplier
+            final_sl_distance = max(raw_sl_distance, current_price * MIN_SL_DISTANCE_PCT)
+            stop_loss = current_price - final_sl_distance
             risk_amount = current_price - stop_loss
             take_profit = current_price + (risk_amount * self.rr_ratio)
         elif signal_type == "SELL":
-            stop_loss = current_price + (atr * actual_multiplier)
+            # HOTFIX 1.2: Enforce minimum 0.35% SL distance
+            raw_sl_distance = atr * actual_multiplier
+            final_sl_distance = max(raw_sl_distance, current_price * MIN_SL_DISTANCE_PCT)
+            stop_loss = current_price + final_sl_distance
             risk_amount = stop_loss - current_price
             take_profit = current_price - (risk_amount * self.rr_ratio)
         else:

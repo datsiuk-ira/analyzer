@@ -275,16 +275,21 @@ class MarketAnalyzer:
                     kcu = kc[kc_upper_list[0]]
                     kcl = kc[kc_lower_list[0]]
                     
-                    df['is_squeeze'] = (bbu < kcu) & (bbl > kcl)
+                    # HOTFIX 1.1: Use .values (numpy arrays) to avoid
+                    # 'Can only compare identically-labeled Series' crash.
+                    # This happens when bbands/kc have misaligned indices after
+                    # a prior dropna() or pd.concat() operation.
+                    df['is_squeeze'] = (bbu.values < kcu.values) & (bbl.values > kcl.values)
                     
                     # Squeeze Breakout Detection
                     # Was in a squeeze recently (last 5 candles)
                     was_in_squeeze = df['is_squeeze'].rolling(window=5).max().astype(bool)
                     
                     # Long Breakout: Recently in squeeze AND Price closed ABOVE Upper BB
-                    df['squeeze_breakout_long'] = was_in_squeeze & (df['close'] > bbu)
+                    # Use .values on bbu/bbl to stay index-safe
+                    df['squeeze_breakout_long'] = was_in_squeeze & (df['close'].values > bbu.values)
                     # Short Breakout: Recently in squeeze AND Price closed BELOW Lower BB
-                    df['squeeze_breakout_short'] = was_in_squeeze & (df['close'] < bbl)
+                    df['squeeze_breakout_short'] = was_in_squeeze & (df['close'].values < bbl.values)
                 else:
                     logger.warning("Squeeze detection failed: missing BB or KC columns.")
                     df['is_squeeze'] = False
