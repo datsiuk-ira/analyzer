@@ -142,12 +142,18 @@ class ScalpingStrategy(BaseStrategy):
         if rsi_crossed_down: short_score_map['RSI_Cross'] = 1.5
         
         # 3b. RSI Extreme Zones — Task 6.2: HEAVY WEIGHT for mean-reversion alpha.
-        # Task 10.3: Catch the Wick (Remove Color Delay)
-        # Task 12.1: Revert RSI Thresholds to 30/70
+        # Task 14.2: RSI Price Action Lock — require candle color confirmation.
+        # RSI < 30 on a red candle is a falling knife; only buy the dip on a green bounce.
         rsi_val = self._get_scalar(last_row, 'RSI', 50)
         
-        if rsi_val < 30: long_score_map['RSI_Oversold'] = 2.0
-        if rsi_val > 70: short_score_map['RSI_Overbought'] = 2.0
+        # Candle color for current bar (needed by RSI lock & directional volume)
+        _open = self._get_scalar(current_row, 'open')
+        _close = self._get_scalar(current_row, 'close')
+        is_green = _close > _open
+        is_red = _close < _open
+        
+        if rsi_val < 30 and is_green: long_score_map['RSI_Oversold'] = 2.0
+        if rsi_val > 70 and is_red: short_score_map['RSI_Overbought'] = 2.0
         
         # 4. RSI Divergence
         if has_bull_div: long_score_map['RSI_Div'] = 2.0
@@ -162,10 +168,16 @@ class ScalpingStrategy(BaseStrategy):
         # if sq_break_long: long_score_map['Squeeze'] = 1.5
         # if sq_break_short: short_score_map['Squeeze'] = 1.5
         
-        # 6. Volume Validation (ROUND 2: Adaptive threshold) - FIX: Directional assignment
-        vol_points = 0.0
-        if vol_ratio > adaptive_vol_threshold * 1.5: vol_points = 1.0
-        elif vol_ratio > adaptive_vol_threshold: vol_points = 0.5
+        # 6. Volume Validation — Task 14.1: Directional Volume
+        # A volume spike on a RED candle is bearish (dump); on a GREEN candle is bullish.
+        vol_ma_val = self._get_scalar(last_row, 'VOL_MA')
+        if not pd.isna(vol_ma_val) and vol_ma_val > 0 and current_row['volume'] > 1.5 * vol_ma_val:
+            if is_green:
+                long_score_map['Volume'] = 1.0
+                short_score_map['Volume'] = 0.5   # Exhaustion volume
+            elif is_red:
+                short_score_map['Volume'] = 1.0
+                long_score_map['Volume'] = 0.5    # Capitulation volume
         
         # 7. Order Flow (CVD Delta) - FIX: Directional assignment
         delta_points_long = 0.0
@@ -182,16 +194,14 @@ class ScalpingStrategy(BaseStrategy):
             elif not delta_increasing and self._get_scalar(last_row, 'delta', 0) < 0:
                 delta_points_short = 0.5
         
-        # Assign volume and delta to the dominant direction only
-        if vol_points > 0 or delta_points_long > 0 or delta_points_short > 0:
+        # Assign delta to the dominant direction only
+        if delta_points_long > 0 or delta_points_short > 0:
             long_total = sum(long_score_map.values())
             short_total = sum(short_score_map.values())
             
             if long_total >= short_total:
-                if vol_points > 0: long_score_map['Volume'] = vol_points
                 if delta_points_long > 0: long_score_map['Delta'] = delta_points_long
             else:
-                if vol_points > 0: short_score_map['Volume'] = vol_points
                 if delta_points_short > 0: short_score_map['Delta'] = delta_points_short
 
         # 8. Sentiment (Contrarian)
@@ -441,11 +451,11 @@ class ScalpingStrategy(BaseStrategy):
         total_range = current_row['high'] - current_row['low']
         body_filter_ok = (body_size >= vol_threshold * total_range) if total_range > 0 else False
 
-        # Balanced thresholds: quality signals with reasonable frequency
-        # Task 13.4: Calibrated MIN_SCORE down as trend indicator points were deleted
-        MIN_SCORE = 3.5  
+        # Task 14.3: Raise MIN_SCORE back to 4.0 — requires either:
+        #   BB Pin-Bar (3.0) + Volume (1.0), or RSI Extreme (2.0) + RSI Divergence (2.0)
+        MIN_SCORE = 4.0
         if adx_value > 35:
-            MIN_SCORE = 3.0
+            MIN_SCORE = 3.5
 
         MIN_COMPONENTS = 2  # Require at least 2 confirmed factors
         
