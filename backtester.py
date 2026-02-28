@@ -193,12 +193,6 @@ class Backtester:
                             'entry_index': i,
                             'entry_time': timestamp,
                             'entry_fee': entry_fee,
-                            'partial_tp_hit': False,
-                            # Task 5.2: Partial TP trigger changed from 1.0R → 0.6R.
-                            # On 1m BTC charts with tight stops, price often spikes
-                            # to 0.6-0.8R and reverses before reaching a full R.
-                            # Taking 50% off at 0.6R locks profit on these spikes.
-                            'partial_tp_price': fill_price + (0.6 * sl_dist) if self.pending_order['direction'] == 'BUY' else fill_price - (0.6 * sl_dist),
                             'leverage': self.pending_order['leverage'],
                             'atr': self.pending_order['atr'],
                             'avg_entry': fill_price,
@@ -235,169 +229,67 @@ class Backtester:
                 
                 current_r = open_pnl / risk_amt if risk_amt > 0 else 0
                 
-                # ─── Time-Based Stagnation Exit ───
-                # Task 6.3a: 20 candles / 0.2R — gives high-leverage mean-reversion
-                # trades slightly more breathing room than the Task 5.1 15/0.5R threshold,
-                # while still cutting anything truly dead before it bleeds out.
-                entry_idx_val = trade.get('entry_index', i)
-                duration = i - entry_idx_val
-                if duration >= 20 and current_r < 0.2:  # Task 6.3a: was `>= 15 and < 0.5`
-                    hit_stagnation = True
-                    logger.debug(f"[EXIT] Stagnation at candle {i}, duration={duration}, R={current_r:.2f}")
+                # ─── Time-Based Stagnation Exit (Task 12.2: Removed entirely) ───
+                # Trades now live and die by their SL or TP targets exclusively.
 
                 # ─── Volume-Climax Exit ───
-                # Vol > 3*Avg AND Adverse Move > 0.5*ATR
-                vol_ma_val = self.df['volume'].rolling(20).mean().iloc[i] if i >= 20 else self.df['volume'].iloc[:i+1].mean()
-                if current_row['volume'] > 3 * vol_ma_val:
-                    atr = trade.get('atr', price * 0.01)
-                    # Bug #14 fix: widen threshold from 0.5×ATR to 1.0×ATR (was triggering on normal vol)
-                    if trade['direction'] == 'BUY':
-                        if current_row['close'] < trade['entry'] - (1.0 * atr):
-                            hit_climax = True
-                            logger.debug(f"[EXIT] Volume Climax (BUY adverse) at candle {i}")
-                    else:
-                        if current_row['close'] > trade['entry'] + (1.0 * atr):
-                            hit_climax = True
-                            logger.debug(f"[EXIT] Volume Climax (SELL adverse) at candle {i}")
+                # Disabled for Phase 7: Often stopped out on exact bottom/top wick
+                # vol_ma_val = self.df['volume'].rolling(20).mean().iloc[i] if i >= 20 else self.df['volume'].iloc[:i+1].mean()
+                # if current_row['volume'] > 3 * vol_ma_val:
+                #     atr = trade.get('atr', price * 0.01)
+                #     if trade['direction'] == 'BUY':
+                #         if current_row['close'] < trade['entry'] - (1.0 * atr):
+                #             hit_climax = True
+                #             logger.debug(f"[EXIT] Volume Climax (BUY adverse) at candle {i}")
+                #     else:
+                #         if current_row['close'] > trade['entry'] + (1.0 * atr):
+                #             hit_climax = True
+                #             logger.debug(f"[EXIT] Volume Climax (SELL adverse) at candle {i}")
                 
                 # ─── Dynamic Pyramiding ───
-                # Trigger at 1.5R (raised from 0.8R — must be truly profitable first)
-                pyramid_trigger_r = 1.5
-                
-                if current_r > pyramid_trigger_r and not trade.get('pyramided', False):
-                    # Bug #10 fix: 5% not 15%; Bug #19 fix: use FEE_RATE not hardcoded 0.01%
-                    add_qty_size = (self.balance * 0.05 * trade['leverage']) / current_row['close']
-                    new_total_qty = trade['qty'] + add_qty_size
-                    
-                    # Weighted avg entry
-                    old_cost = trade['qty'] * trade['avg_entry']
-                    new_cost = add_qty_size * current_row['close']
-                    new_avg = (old_cost + new_cost) / new_total_qty
-                    
-                    trade['qty'] = new_total_qty
-                    trade['avg_entry'] = new_avg
-                    trade['pyramided'] = True
-                    
-                    pyramid_fee = (add_qty_size * current_row['close']) * FEE_RATE
-                    self.balance -= pyramid_fee
-                    trade['entry_fee'] += pyramid_fee
-                    
-                    # Bug #7 fix: do NOT move SL to avg_entry — preserve the trailing SL
-                    # Only ensure SL is at least at breakeven (avg_entry)
-                    if trade['direction'] == 'BUY':
-                        trade['sl'] = max(trade['sl'], new_avg)
-                        trade['liq_price'] = new_avg * (1 - (0.8 / trade['leverage']))
-                    else:
-                        trade['sl'] = min(trade['sl'], new_avg)
-                        trade['liq_price'] = new_avg * (1 + (0.8 / trade['leverage']))
-                    
-                    self.trades.append({
-                        'symbol': 'BACKTEST', 'direction': trade['direction'],
-                        'entry': current_row['close'], 'qty': add_qty_size,
-                        'exit_price': 0, 'result': 'PYRAMID_ENTRY', 
-                        'entry_time': timestamp, 'exit_time': timestamp, 
-                        'pnl': 0, 'fees': pyramid_fee,
-                        'leverage': trade['leverage']
-                    })
-                    logger.debug(f"[PYRAMID] Added {add_qty_size:.6f} qty at {current_row['close']:.4f}, new avg={new_avg:.4f}")
+                # Task 9.3: Pyramiding Disabled 
+                # Mean reversion entries cannot be pyramided without destroying average entry price.
+                # if current_r > pyramid_trigger_r and not trade.get('pyramided', False):
+                # ... pyramiding logic removed ...
 
-                # ─── Trailing Stop (2.0 ATR, activates at 0.7R) ───
-                atr_val = trade.get('atr', price * 0.01)
-                # Trail dist 1.0 ATR — proportional to tighter SL
-                trail_dist = 1.0 * atr_val
-                
-                if current_r > 1.0:  # Activate at 1.0R (break-even territory)
-                    if trade['direction'] == 'BUY':
-                        new_sl = current_row['close'] - trail_dist
-                        if new_sl > trade['sl']:
-                            trade['sl'] = new_sl
-                            logger.debug(f"[TRAIL] BUY SL moved up to {new_sl:.4f} at candle {i}")
-                    else:
-                        new_sl = current_row['close'] + trail_dist
-                        if new_sl < trade['sl']:
-                            trade['sl'] = new_sl
-                            logger.debug(f"[TRAIL] SELL SL moved down to {new_sl:.4f} at candle {i}")
+                # ─── Trailing Stop ───
+                # Task 9.4: Trailing Stop Disabled
+                # Binary executions only (1.5R). Trails cut winners early.
+                # trail_dist = 1.0 * atr_val
+                # if current_r > 1.0: ... trail logic removed ...
 
                 # ═══════════════════════════════════════════════
                 # Check Exits (SINGLE block — no duplicates)
                 # ═══════════════════════════════════════════════
                 if trade['direction'] == 'BUY':
-                    # Priority: Liquidation > SL > TP > Partial TP
-                    if current_row['low'] <= trade.get('liq_price', 0):
-                        hit_liq = True
-                        # HOTFIX 2.2: Slippage on liquidation (executed below liq price)
-                        exit_price = trade['liq_price'] * (1 - SLIPPAGE_RATE)
-                    elif current_row['low'] <= trade['sl']:
+                    # Priority: SL > Liquidation > TP (Task 9.1: Fix exit bug)
+                    if current_row['low'] <= trade['sl']:
                         hit_sl = True
                         # HOTFIX 2.2: Slippage on SL fill (selling into a falling market)
                         exit_price = trade['sl'] * (1 - SLIPPAGE_RATE)
+                    elif current_row['low'] <= trade.get('liq_price', 0):
+                        hit_liq = True
+                        # HOTFIX 2.2: Slippage on liquidation (executed below liq price)
+                        exit_price = trade['liq_price'] * (1 - SLIPPAGE_RATE)
                     elif current_row['high'] >= trade['tp']:
                         hit_tp = True
-                        # HOTFIX 2.2: Slippage on TP fill (slightly below TP level)
-                        exit_price = trade['tp'] * (1 - SLIPPAGE_RATE)
-                    elif not trade.get('partial_tp_hit') and current_row['high'] >= trade.get('partial_tp_price', 999999):
-                        # Task 4.3 / HOTFIX 2.3: Partial TP at 1.0R — closes 50%, moves SL
-                        # to break-even WITH a 0.05% noise buffer (Task 4.4) so random
-                        # 1m spread/wick doesn't stop us out before the trend resumes.
-                        trade['partial_tp_hit'] = True
-                        trade['sl'] = trade['avg_entry'] - (price * 0.0005)  # Task 4.4: 0.05% below BE
-                        
-                        close_ratio = 0.50  # HOTFIX 2.3: Was 0.70
-                        partial_qty = trade['qty'] * close_ratio
-                        trade['qty'] -= partial_qty
-                        
-                        # HOTFIX 2.2: Apply slippage to partial exit price
-                        partial_exit_price = trade['partial_tp_price'] * (1 - SLIPPAGE_RATE)
-                        partial_fee = (partial_qty * partial_exit_price) * FEE_RATE
-                        # qty = risk/SL_dist already encodes leverage — do NOT multiply again
-                        partial_pnl = (partial_exit_price - trade['avg_entry']) * partial_qty - partial_fee
-                        self.balance += partial_pnl
-                        self.trades.append({
-                            'symbol': 'BACKTEST', 'direction': 'BUY', 'entry': trade['avg_entry'],
-                            'exit_price': partial_exit_price, 'entry_time': trade['entry_time'],
-                            'exit_time': timestamp, 'result': 'Partial TP', 'pnl': partial_pnl,
-                            'qty': partial_qty, 'fees': partial_fee,
-                            'leverage': trade['leverage']
-                        })
-                        logger.debug(f"[PARTIAL_TP] BUY closed {close_ratio*100:.0f}% at {partial_exit_price:.4f}, PnL={partial_pnl:.2f}, SL→BE")
+                        # Task 9.2: Maker TP orders suffer 0 slippage
+                        exit_price = trade['tp']
 
                 else:  # SELL
-                    if current_row['high'] >= trade.get('liq_price', 999999):
-                        hit_liq = True
-                        # HOTFIX 2.2: Slippage on liquidation (executed above liq price)
-                        exit_price = trade['liq_price'] * (1 + SLIPPAGE_RATE)
-                    elif current_row['high'] >= trade['sl']:
+                    # Priority: SL > Liquidation > TP (Task 9.1: Fix exit bug)
+                    if current_row['high'] >= trade['sl']:
                         hit_sl = True
                         # HOTFIX 2.2: Slippage on SL fill (buying into a rising market)
                         exit_price = trade['sl'] * (1 + SLIPPAGE_RATE)
+                    elif current_row['high'] >= trade.get('liq_price', 999999):
+                        hit_liq = True
+                        # HOTFIX 2.2: Slippage on liquidation (executed above liq price)
+                        exit_price = trade['liq_price'] * (1 + SLIPPAGE_RATE)
                     elif current_row['low'] <= trade['tp']:
                         hit_tp = True
-                        # HOTFIX 2.2: Slippage on TP fill (slightly above TP level)
-                        exit_price = trade['tp'] * (1 + SLIPPAGE_RATE)
-                    elif not trade.get('partial_tp_hit') and current_row['low'] <= trade.get('partial_tp_price', 0):
-                        # Task 4.4: SELL partial TP — move SL to 0.05% ABOVE break-even
-                        # to absorb spread/noise before the short continues lower.
-                        trade['partial_tp_hit'] = True
-                        trade['sl'] = trade['avg_entry'] + (price * 0.0005)  # Task 4.4: 0.05% above BE
-                        
-                        close_ratio = 0.50  # HOTFIX 2.3: Was 0.70
-                        partial_qty = trade['qty'] * close_ratio
-                        trade['qty'] -= partial_qty
-                        
-                        # HOTFIX 2.2: Apply slippage to SELL partial exit (buying back)
-                        partial_exit_price = trade['partial_tp_price'] * (1 + SLIPPAGE_RATE)
-                        partial_fee = (partial_qty * partial_exit_price) * FEE_RATE
-                        # qty encodes leverage — do NOT multiply again
-                        partial_pnl = (trade['avg_entry'] - partial_exit_price) * partial_qty - partial_fee
-                        self.balance += partial_pnl
-                        self.trades.append({
-                            'symbol': 'BACKTEST', 'direction': 'SELL', 'entry': trade['avg_entry'],
-                            'exit_price': partial_exit_price, 'entry_time': trade['entry_time'],
-                            'exit_time': timestamp, 'result': 'Partial TP', 'pnl': partial_pnl,
-                            'qty': partial_qty, 'fees': partial_fee,
-                            'leverage': trade['leverage']
-                        })
-                        logger.debug(f"[PARTIAL_TP] SELL closed {close_ratio*100:.0f}% at {partial_exit_price:.4f}, PnL={partial_pnl:.2f}, SL→BE")
+                        # Task 9.2: Maker TP orders suffer 0 slippage
+                        exit_price = trade['tp']
 
                 # ─── Stagnation / Climax exit price (applies to BOTH directions) ───
                 # HOTFIX 2.2: Apply slippage to market exits (stagnation / climax)
@@ -542,21 +434,27 @@ class Backtester:
                     current_leverage = min(mapped_leverage, exchange_cap)
                     current_leverage = round(current_leverage, 1)
 
-                    # 3% of balance used as collateral margin
-                    MARGIN_PCT = 0.03
+                    # Task 12.3: Scale for +75% Portfolio Return
+                    MARGIN_PCT = 0.10
                     margin_amount = self.balance * MARGIN_PCT
                     position_value = margin_amount * current_leverage
                     qty = position_value / price if price > 0 else 0
 
-                    # SL/TP distances — 1.0 ATR floor (min 0.35%), fixed 1.5R target
-                    sl_dist_pct = max(1.0 * atr_val / price, MIN_SL_DISTANCE_PCT)
-                    tp_dist_pct = sl_dist_pct * 1.5  # Task 6.1: hardcoded 1.5R, fast scalping
+                    # SL/TP distances — 1.0 ATR floor (min 0.35%)
+                    # Task 8.1: Clamp SL against Liquidation Price
+                    base_sl_dist = max(1.0 * atr_val / price, MIN_SL_DISTANCE_PCT)
+                    max_sl_allowed = 0.75 / current_leverage
+                    sl_dist_pct = min(base_sl_dist, max_sl_allowed)
+                    
+                    # Task 12.3: Scale for +75% Portfolio Return
+                    # Task 13.2: Overcome 50x Fee Drag (2.0R Target). 1.5R lost too much to absolute slippage/fees.
+                    tp_dist_pct = sl_dist_pct * 2.0
                     # ─────────────────────────────────────────────────────────────────
 
                     # ─── Entry Logic ───
 
-                    # Task 6.3b: Market entry for ANY confirmed signal with ADX > 15.
-                    if adx_val > 15:  # Task 6.3b: was `20 < adx_val < 35`
+                    # Task 7.2: Market entry for ALL confirmed A-grade signals (removed ADX limit)
+                    if True:
                         # HOTFIX 2.2: Worsen market entry price by slippage
                         if signal.type == SignalType.BUY:
                             executed_price = price * (1 + SLIPPAGE_RATE)
@@ -578,11 +476,6 @@ class Backtester:
                             'sl': sl, 'tp': tp, 'liq_price': liq_price,
                             'entry_time': timestamp,
                             'entry_fee': entry_fee,
-                            'partial_tp_hit': False,
-                            # Task 5.2: Partial TP trigger at 0.6R (was 1.0R).
-                            # 0.6R is achievable on quick 1m scalps; waiting for
-                            # 1.0R forfeited profits on reversal spikes.
-                            'partial_tp_price': executed_price + (0.6 * (executed_price * sl_dist_pct)) if signal.type == SignalType.BUY else executed_price - (0.6 * (executed_price * sl_dist_pct)),
                             'leverage': current_leverage,
                             'atr': atr_val,
                             'avg_entry': executed_price,
@@ -661,7 +554,8 @@ class Backtester:
                 "Max Drawdown %": 0,
                 "Sharpe Ratio": 0,
                 "trades": pd.DataFrame(),
-                "equity_curve": pd.DataFrame(self.equity_curve)
+                "equity_curve": pd.DataFrame(self.equity_curve),
+                "price_data": self.df[['timestamp', 'open', 'high', 'low', 'close']] if not self.df.empty else pd.DataFrame()
             }
             
         df_trades = pd.DataFrame(self.trades)
@@ -743,5 +637,6 @@ class Backtester:
             "Max Drawdown %": round(max_drawdown_pct, 2),
             "Sharpe Ratio": round(sharpe, 2),
             "trades": df_trades,
-            "equity_curve": equity_df if not equity_df.empty else pd.DataFrame(self.equity_curve)
+            "equity_curve": equity_df if not equity_df.empty else pd.DataFrame(self.equity_curve),
+            "price_data": self.df[['timestamp', 'open', 'high', 'low', 'close']] if not self.df.empty else pd.DataFrame()
         }

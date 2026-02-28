@@ -142,11 +142,12 @@ class ScalpingStrategy(BaseStrategy):
         if rsi_crossed_down: short_score_map['RSI_Cross'] = 1.5
         
         # 3b. RSI Extreme Zones — Task 6.2: HEAVY WEIGHT for mean-reversion alpha.
-        # RSI < 30 and RSI > 70 are statistically the highest-probability snap-back
-        # zones on 1m BTC. Weighting at 2.0 ensures these dominate the score.
+        # Task 10.3: Catch the Wick (Remove Color Delay)
+        # Task 12.1: Revert RSI Thresholds to 30/70
         rsi_val = self._get_scalar(last_row, 'RSI', 50)
-        if rsi_val < 30: long_score_map['RSI_Oversold'] = 2.0   # Task 6.2: was 0.5 at 25 threshold
-        if rsi_val > 70: short_score_map['RSI_Overbought'] = 2.0 # Task 6.2: was 0.5 at 75 threshold
+        
+        if rsi_val < 30: long_score_map['RSI_Oversold'] = 2.0
+        if rsi_val > 70: short_score_map['RSI_Overbought'] = 2.0
         
         # 4. RSI Divergence
         if has_bull_div: long_score_map['RSI_Div'] = 2.0
@@ -157,8 +158,9 @@ class ScalpingStrategy(BaseStrategy):
         if last_row.get('bearish_sfp'): short_score_map['SFP'] = 2.5
 
         # 5b. Squeeze Breakout (Reduced Priority)
-        if sq_break_long: long_score_map['Squeeze'] = 1.5
-        if sq_break_short: short_score_map['Squeeze'] = 1.5
+        # Task 13.3: Purged Trend Indicators (Conflicts with primary mean-reversion alpha)
+        # if sq_break_long: long_score_map['Squeeze'] = 1.5
+        # if sq_break_short: short_score_map['Squeeze'] = 1.5
         
         # 6. Volume Validation (ROUND 2: Adaptive threshold) - FIX: Directional assignment
         vol_points = 0.0
@@ -229,11 +231,12 @@ class ScalpingStrategy(BaseStrategy):
             short_score_map['Div_Pattern_Combo'] = 1.0
 
         # 12. Stochastic RSI Confluence
-        stoch_k_cols = [c for c in self.df.columns if c.startswith('STOCHRSIk_')]
-        if stoch_k_cols:
-            stoch_k = self._get_scalar(last_row, stoch_k_cols[0])
-            if stoch_k < 20: long_score_map['Stoch_RSI'] = 0.5
-            if stoch_k > 80: short_score_map['Stoch_RSI'] = 0.5
+        # Task 11.1: Purge the Noise Indicators (Stoch_RSI is too sensitive on 1m)
+        # stoch_k_cols = [c for c in self.df.columns if c.startswith('STOCHRSIk_')]
+        # if stoch_k_cols:
+        #     stoch_k = self._get_scalar(last_row, stoch_k_cols[0])
+        #     if stoch_k < 20: long_score_map['Stoch_RSI'] = 0.5
+        #     if stoch_k > 80: short_score_map['Stoch_RSI'] = 0.5
 
         # 13. Institutional Data (OI & Funding) - FIX: OI confirms trend direction
         oi_change = self.institutional_data.get('oi_change', 0)
@@ -297,10 +300,25 @@ class ScalpingStrategy(BaseStrategy):
             if not pd.isna(bb_upper) and not pd.isna(bb_lower) and bb_upper != bb_lower:
                 price = self._get_scalar(last_row, 'close')
                 bb_pct = (price - bb_lower) / (bb_upper - bb_lower)
-                if bb_pct < 0.2:  # Near/below lower band = oversold
-                    long_score_map['BB_Oversold'] = 2.0   # Task 6.2: was 1.0
-                if bb_pct > 0.8:  # Near/above upper band = overbought
-                    short_score_map['BB_Overbought'] = 2.0 # Task 6.2: was 1.0
+                
+                # Task 12.1: The True Wick Rejection (The Smart Reversal)
+                high_val = self._get_scalar(current_row, 'high')
+                low_val = self._get_scalar(current_row, 'low')
+                open_val = self._get_scalar(current_row, 'open')
+                close_val = self._get_scalar(current_row, 'close')
+                
+                candle_range = max(high_val - low_val, 1e-9)
+                lower_wick_pct = (min(open_val, close_val) - low_val) / candle_range
+                upper_wick_pct = (high_val - max(open_val, close_val)) / candle_range
+                
+                is_green = close_val > open_val
+                is_red = close_val < open_val
+                
+                # Require absolute low/high to pierce the band, combined with green/red body and >40% wick
+                if low_val < bb_lower and is_green and lower_wick_pct > 0.4: 
+                    long_score_map['BB_Oversold'] = 3.0
+                if high_val > bb_upper and is_red and upper_wick_pct > 0.4: 
+                    short_score_map['BB_Overbought'] = 3.0
 
         # 17. OBV Slope (volume momentum)
         if 'OBV' in self.df.columns and index >= 5:
@@ -313,25 +331,27 @@ class ScalpingStrategy(BaseStrategy):
                 if obv_slope < 0: 
                     short_score_map['OBV_Falling'] = 0.5
 
-        # 18. CMF (Chaikin Money Flow) — institutional money direction
-        cmf = self._get_scalar(last_row, 'CMF', 0)
-        if not pd.isna(cmf):
-            if cmf > 0.1: 
-                long_score_map['CMF_Inflow'] = 0.5
-            if cmf < -0.1: 
-                short_score_map['CMF_Outflow'] = 0.5
+        # 18. CMF (Chaikin Money Flow)
+        # Task 13.3: Purged Trend Indicators
+        # cmf = self._get_scalar(last_row, 'CMF', 0)
+        # if abs(cmf) > 0.05:
+        #     if cmf > 0:
+        #         long_score_map['CMF_Inflow'] = 0.5
+        #     else:
+        #         short_score_map['CMF_Outflow'] = 0.5
 
         # 19. Ichimoku Cloud Position
-        isa = self._get_scalar(last_row, 'ISA_9')
-        isb = self._get_scalar(last_row, 'ISB_26')
-        if isa and isb and not pd.isna(isa) and not pd.isna(isb):
-            price = self._get_scalar(last_row, 'close')
-            cloud_top = max(isa, isb)
-            cloud_bottom = min(isa, isb)
-            if price > cloud_top: 
-                long_score_map['Ichimoku_Above'] = 1.0
-            if price < cloud_bottom: 
-                short_score_map['Ichimoku_Below'] = 1.0
+        # Task 13.3: Purged Trend Indicators
+        # senkou_a = self._get_scalar(last_row, 'ISA_9')
+        # senkou_b = self._get_scalar(last_row, 'ISB_26')
+        # if senkou_a and senkou_b and not pd.isna(senkou_a) and not pd.isna(senkou_b):
+        #     cloud_top = max(senkou_a, senkou_b)
+        #     cloud_bottom = min(senkou_a, senkou_b)
+        #     price = self._get_scalar(last_row, 'close')
+        #     if price > cloud_top:
+        #         long_score_map['Ichimoku_Above'] = 1.0
+        #     elif price < cloud_bottom:
+        #         short_score_map['Ichimoku_Below'] = 1.0
 
         # 20. VWAP Deviation — institutional price benchmark
         vwap = self._get_scalar(last_row, 'VWAP')
@@ -351,10 +371,11 @@ class ScalpingStrategy(BaseStrategy):
             if roc < -2.0: short_score_map['ROC_Momentum'] = 0.5
 
         # ROUND 5: Williams %R
-        willr = self._get_scalar(last_row, 'WILLR')
-        if willr is not None and not pd.isna(willr):
-            if willr < -80: long_score_map['Williams_R'] = 0.5  # Oversold
-            if willr > -20: short_score_map['Williams_R'] = 0.5  # Overbought
+        # Task 11.1: Purge the Noise Indicators (Williams R is too sensitive on 1m)
+        # willr = self._get_scalar(last_row, 'WILLR')
+        # if willr is not None and not pd.isna(willr):
+        #     if willr < -80: long_score_map['Williams_R'] = 0.5  # Oversold
+        #     if willr > -20: short_score_map['Williams_R'] = 0.5  # Overbought
 
         long_score = sum(long_score_map.values())
         short_score = sum(short_score_map.values())
@@ -366,21 +387,7 @@ class ScalpingStrategy(BaseStrategy):
             if short_score >= 4.0 and not self.regime.can_trade_short():
                 return Signal(SignalType.NEUTRAL, f"SHORT Blocked by BTC Correlation ({self.regime.regime})", "Scalping")
         
-        # ROUND 8: Hard Trend Filter (EMA200)
-        # Block counter-trend trades unless Reversal Pattern detected
-        if ema_trend and not pd.isna(ema_trend):
-            adx_val = self._get_scalar(last_row, 'ADX', 0)
-            
-            # Bullish Trend: Block SHORTs unless reversal pattern OR Reversal Mode (high ADX)
-            if self._get_scalar(current_row, 'close') > ema_trend:
-                if short_score > long_score and not has_bearish_pattern and adx_val <= 30:
-                    return Signal(SignalType.NEUTRAL, "SHORT Blocked: Counter-trend without Reversal Pattern/ADX", "Scalping")
-            
-            # Bearish Trend: Block LONGs unless reversal pattern OR Reversal Mode (high ADX)
-            if self._get_scalar(current_row, 'close') < ema_trend:
-                # FIX: Allow if ADX > 30 (Explosive Reversal)
-                if long_score > short_score and not has_bullish_pattern and adx_val <= 30:
-                     return Signal(SignalType.NEUTRAL, "LONG Blocked: Counter-trend without Reversal Pattern/ADX", "Scalping")
+        # ROUND 8: Hard Trend Filter (EMA200) removed for Phase 7 (Mean Reversion Unchained)
         
         # Kaufman Efficiency Ratio Check (Noise Filter)
         er = self._get_scalar(last_row, 'efficiency_ratio', 1.0)
@@ -413,33 +420,7 @@ class ScalpingStrategy(BaseStrategy):
     # ROUND 10: Adaptive Scoring
         # Default = 5.0 (Reduced from 6.0)
         # If Trend Aligned (HTF Bullish for Long), reduced to        # ROUND 13: Trend Lock (Pullback Rule)
-        # LONG: (EMA_20 > EMA_50 AND Price > EMA_200) OR (EMA_20 > EMA_50 AND ADX > 30)
-        # SHORT: (EMA_20 < EMA_50 AND Price < EMA_200) OR (EMA_20 < EMA_50 AND ADX > 30)
-        
-        adx_val = current_row.get('ADX', 0)
-        ema_20 = self._get_scalar(last_row, 'EMA_FAST', 0)
-        ema_50 = self._get_scalar(last_row, 'EMA_SLOW', 0)
-        ema_200 = self._get_scalar(last_row, 'EMA_TREND', 0)
-        current_close = current_row['close']
-        
-        long_lock_ok = False
-        short_lock_ok = False
-
-        # ROUND 14: Trend Lock "Reversal Mode"
-        # Allow Long if Golden Cross (Fast > Slow) AND (Price > 200 OR ADX > 30)
-        # This catches the explosive start of a reversal even if Price < EMA_200
-        
-        if ema_20 > ema_50:
-            if current_close > ema_200:
-                long_lock_ok = True
-            elif adx_val > 35:  # Reversal Mode: require stronger trend (raised from 30→35)
-                long_lock_ok = True
-        
-        if ema_20 < ema_50:
-            if current_close < ema_200:
-                short_lock_ok = True
-            elif adx_val > 35:  # Reversal Mode: require stronger trend (raised from 30→35)
-                short_lock_ok = True
+        # ROUND 13/14 removed for Phase 7 (Mean Reversion Unchained)
         
         # ROUND 12: Candle Body Filter
         # Body must be at least 50% of Total Range        # ROUND 13: Volume Sensitivity for Body Filter
@@ -461,19 +442,17 @@ class ScalpingStrategy(BaseStrategy):
         body_filter_ok = (body_size >= vol_threshold * total_range) if total_range > 0 else False
 
         # Balanced thresholds: quality signals with reasonable frequency
-        # Task 6.2: MIN_SCORE raised to 4.5 baseline — only A-grade setups with
-        # multiple confluences should fire (RSI + BB alone = 4.0, need one more)
-        MIN_SCORE = 4.5  # Task 6.2: enforces multi-confluence A-grade requirement
-        # Super-Trend (ADX > 35): slightly easier entry for extreme momentum
+        # Task 13.4: Calibrated MIN_SCORE down as trend indicator points were deleted
+        MIN_SCORE = 3.5  
         if adx_value > 35:
-            MIN_SCORE = 4.0
+            MIN_SCORE = 3.0
 
         MIN_COMPONENTS = 2  # Require at least 2 confirmed factors
         
         # print(f"DEBUG: Score={long_score}. Min={MIN_SCORE}. Comps={len(long_score_map)}. Lock={long_lock_ok}. Body={body_filter_ok}. TrendStr={trend_strength_ok}")
 
         if (long_score >= MIN_SCORE and len(long_score_map) >= MIN_COMPONENTS 
-            and long_lock_ok and body_filter_ok and trend_strength_ok):
+            and body_filter_ok and trend_strength_ok):
             logger.info(f"FOUND SIGNAL: LONG | Score: {long_score} | Min: {MIN_SCORE}")
             reason = "Scalping Long: "
             if last_row.get('bullish_sfp'): reason += "SFP Liquidity Sweep"
@@ -507,9 +486,8 @@ class ScalpingStrategy(BaseStrategy):
             signal.adx = adx_value # ROUND 11: For Aggressive Entry 
             return signal
         
-        # Short Logic
         if (short_score >= MIN_SCORE and len(short_score_map) >= MIN_COMPONENTS 
-            and short_lock_ok and body_filter_ok and trend_strength_ok):
+            and body_filter_ok and trend_strength_ok):
             logger.info(f"FOUND SIGNAL: SHORT | Score: {short_score} | Min: {MIN_SCORE}")
             reason = "Scalping Short: "
             if last_row.get('bearish_sfp'): reason += "SFP Liquidity Sweep"
@@ -541,7 +519,7 @@ class ScalpingStrategy(BaseStrategy):
         
         # Default Neutral if no signal generated
         # debug info attached
-        reason = f"No scalping confluence ({long_score}/{short_score}). L={long_lock_ok}, B={body_filter_ok}, T={trend_strength_ok}, C={len(long_score_map)}"
+        reason = f"No scalping confluence ({long_score}/{short_score}). B={body_filter_ok}, T={trend_strength_ok}, C={len(long_score_map)}"
         return Signal(SignalType.NEUTRAL, reason, "Scalping", debug_info=debug_info)
 
 class SwingStrategy(BaseStrategy):
@@ -715,8 +693,8 @@ class SwingStrategy(BaseStrategy):
             "ER": f"{er:.2f}"
         }
 
-        # Lowered thresholds for more trades
-        MIN_SCORE = 3.5
+        # Lowered thresholds for more trades (Task 13.4)
+        MIN_SCORE = 3.0
         MIN_COMPONENTS = 2
 
         if long_score >= MIN_SCORE and len(long_score_map) >= MIN_COMPONENTS and htf_info != "Bearish":

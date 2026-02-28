@@ -113,6 +113,55 @@ def render_backtest_view(symbol):
                                       yaxis_title="Balance (USDT)", height=400, hovermode='x unified')
                     st.plotly_chart(fig, use_container_width=True)
 
+                # Trade Chart
+                if 'price_data' in res and not res['price_data'].empty and not res['trades'].empty:
+                    st.subheader("📊 Trade Chart")
+                    df_price = res['price_data']
+                    trades_df = res['trades']
+                    
+                    fig_trades = go.Figure()
+                    
+                    # Candlestick or Line for price
+                    fig_trades.add_trace(go.Scatter(
+                        x=df_price['timestamp'], y=df_price['close'],
+                        mode='lines', name='Price', line=dict(color='#3b82f6', width=1.5)
+                    ))
+                    
+                    # Entry Markers
+                    buys = trades_df[trades_df['direction'] == 'BUY']
+                    if not buys.empty:
+                        fig_trades.add_trace(go.Scatter(
+                            x=buys['entry_time'], y=buys['entry'],
+                            mode='markers', name='BUY Entry',
+                            marker=dict(symbol='triangle-up', size=12, color='#22c55e', line=dict(width=1, color='white'))
+                        ))
+                        
+                    sells = trades_df[trades_df['direction'] == 'SELL']
+                    if not sells.empty:
+                        fig_trades.add_trace(go.Scatter(
+                            x=sells['entry_time'], y=sells['entry'],
+                            mode='markers', name='SELL Entry',
+                            marker=dict(symbol='triangle-down', size=12, color='#ef4444', line=dict(width=1, color='white'))
+                        ))
+                        
+                    # Exit Markers
+                    exits = trades_df[trades_df['exit_price'] > 0]
+                    if not exits.empty:
+                        # Color exits based on PnL
+                        exit_colors = ['#22c55e' if pnl > 0 else '#ef4444' for pnl in exits['pnl']]
+                        fig_trades.add_trace(go.Scatter(
+                            x=exits['exit_time'], y=exits['exit_price'],
+                            mode='markers', name='Exit',
+                            marker=dict(symbol='x', size=10, color=exit_colors, line=dict(width=1, color='black'))
+                        ))
+
+                    fig_trades.update_layout(
+                        title="Trades", xaxis_title="Time", yaxis_title="Price", 
+                        height=500, hovermode='x unified',
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+                    )
+                    st.plotly_chart(fig_trades, use_container_width=True)
+
                 # ─── Trade List with signal reason ───────────────────────────────
                 if not res['trades'].empty:
                     trades_df = res['trades'].copy()

@@ -111,18 +111,29 @@ class XGBoostPredictor:
                 logger.debug("[XGB] Only one class in training labels — neutral")
                 return 0.5
 
-            model = xgb.XGBClassifier(
-                n_estimators  = 200,
-                max_depth      = 4,
-                learning_rate  = 0.05,
-                subsample      = 0.8,
-                colsample_bytree = 0.8,
-                use_label_encoder = False,
-                eval_metric    = 'logloss',
-                tree_method    = 'hist',
-                random_state   = 42,
-                verbosity      = 0,
-            )
+            try:
+                # Task 13.1: OS-Resilient ML Fallback
+                model = xgb.XGBClassifier(
+                    n_estimators  = 200,
+                    max_depth      = 4,
+                    learning_rate  = 0.05,
+                    subsample      = 0.8,
+                    colsample_bytree = 0.8,
+                    use_label_encoder = False,
+                    eval_metric    = 'logloss',
+                    tree_method    = 'hist',
+                    random_state   = 42,
+                    verbosity      = 0,
+                )
+            except Exception as e:
+                logger.warning(f"[XGB] XGBoost crash detected ({e}) — falling back native HistGradientBoostingClassifier.")
+                from sklearn.ensemble import HistGradientBoostingClassifier
+                model = HistGradientBoostingClassifier(
+                    max_iter=200, 
+                    max_depth=4, 
+                    learning_rate=0.05,
+                    random_state=42
+                )
             model.fit(X_train, y_train)
             prob_up = float(model.predict_proba(X_last)[0, 1])
 

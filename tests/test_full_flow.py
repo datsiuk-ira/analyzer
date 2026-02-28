@@ -142,11 +142,10 @@ class TestAggressiveFeatures:
 
 
 
-    def test_val_and_pyramiding(self):
+    def test_val_calculation(self):
         """
         Verify:
         1. VAL Logic (Crowd Leverage).
-        2. Pyramiding Trigger at 0.8R (Rising ADX).
         """
         p = [100.0] * 20
         p[5] = 102.0  # > 0.8R (risk ~1.5, so 0.8R=1.2 -> 101.2)
@@ -166,38 +165,12 @@ class TestAggressiveFeatures:
         backtester.strategy_class = lambda *args: strategy
         backtester.run()
         
-        assert len(backtester.trades) >= 2
-        reasons = [t['result'] for t in backtester.trades]
-        assert 'PYRAMID_ENTRY' in reasons
-
-    def test_reentry_bypass(self):
-        """Verify re-entry after Stagnation Exit (Task 5.1: exits at 15 candles / 0.5R)."""
-        p = [100.0] * 60
-        # adx=30: market entry zone (20 < adx < 35) so trades open on flat prices.
-        # adx=35 would route to limit orders which expire unfilled at 1.0 ATR offset.
-        df = create_mock_df(np.array(p), adx=30)
-        
-        backtester = Backtester(df, MockStrategy, {'test_mode': True})
-        strategy = MockStrategy(df.iloc[:2], None, {})
-        
-        sig1 = make_signal(adx=30, label="1")
-        sig2 = make_signal(adx=30, label="2")
-        
-        signals = [Signal(SignalType.NEUTRAL, "", "")] * 60
-        signals[1] = sig1
-        # Task 5.1: Stagnation now exits at candle ~16 (entry=1, 15-candle window).
-        # Re-entry signal at candle 20 — well past the expiry.
-        signals[20] = sig2
-        strategy.signals_list = signals
-        
-        backtester.strategy_class = lambda *args: strategy
-        backtester.run()
-        
+        # In Phase 9 we removed Pyramiding, so only one trade happens.
         assert len(backtester.trades) >= 1
-        assert backtester.trades[0]['result'] == 'Stagnation'
-        
-        has_second = len(backtester.trades) >= 2 or backtester.active_trade is not None
-        assert has_second, "Re-entry failed (Cooldown blocked it?)"
+        reasons = [t['result'] for t in backtester.trades]
+        assert 'PYRAMID_ENTRY' not in reasons
+
+    # Task 12.2: Stagnation Exts removed. test_reentry_bypass deleted.
 
 
 # ═══════════════════════════════════════════════
@@ -241,27 +214,7 @@ class TestProtection:
         real = [t for t in backtester.trades if t['result'] not in ('PYRAMID_ENTRY', 'Partial TP')]
         assert len(real) == 3, f"Expected 3 trades, got {len(real)}: {[t['result'] for t in real]}"
 
-    def test_stagnation_exit(self):
-        """Verify exit after 15 candles if PnL < 0.5R (Task 5.1: was 40 candles / 1.0R)."""
-        prices = [100.0] * 60
-        df = create_mock_df(np.array(prices))
-        backtester = Backtester(df, MockStrategy, {'test_mode': True})
-        strategy = MockStrategy(df.iloc[:2], None, {})
-        
-        sig = make_signal(adx=35)
-        signals = [Signal(SignalType.NEUTRAL, "", "")] * 60
-        signals[1] = sig
-        strategy.signals_list = signals
-        backtester.strategy_class = lambda *args: strategy
-        backtester.run()
-        
-        # Find the stagnation trade
-        stag_trades = [t for t in backtester.trades if t['result'] == 'Stagnation']
-        assert len(stag_trades) >= 1
-        trade = stag_trades[0]
-        # Task 5.1: Entry at i=1. Exit at i=16 (1+15). Duration = 15 minutes.
-        duration_minutes = (trade['exit_time'] - trade['entry_time']).total_seconds() / 60
-        assert duration_minutes >= 15  # Task 5.1: was >= 40
+    # Task 12.2: Stagnation Exits removed. test_stagnation_exit deleted.
 
 
 # ═══════════════════════════════════════════════
